@@ -1,0 +1,11 @@
+{
+  "name": "OmniSci - Practical Feasibility & Research Foundry",
+  "description": "Translates multi-format scientific data, chemical formulas, historical texts, and metrics into actionable step-by-step projects with real material science sourcing, automated regulatory compliance, dual maker/investor roadmaps, space exploration adaptations, and continuous biometric presence security.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
