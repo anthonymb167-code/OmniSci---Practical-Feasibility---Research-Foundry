@@ -1,20 +1,36 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# OmniSci - Practical Feasibility & Research Foundry
 
-# Run and deploy your AI Studio app
+OmniSci is a React and Express application for exploring scientific project feasibility, translating historical research notes, and organizing project plans.
 
-This contains everything you need to run your app locally.
+## Run locally
 
-View your app in AI Studio: https://ai.studio/apps/d4a7b9e0-c211-496d-8c19-20dc0f598d32
-
-## Run Locally
-
-**Prerequisites:**  Node.js
-
+Prerequisite: Node.js compatible with Vite 8.
 
 1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+
+   ```sh
+   npm install
+   ```
+
+2. Copy `.env.example` to `.env.local` and set `GEMINI_API_KEY` to enable Gemini-backed analysis. Keep the key in this server-side environment file; do not add it to client code or commit it. The app can also run without a key, using its built-in demo responses.
+
+3. Start the development server:
+
+   ```sh
+   npm run dev
+   ```
+
+   Open [http://localhost:3000](http://localhost:3000).
+
+## Checks and production
+
+```sh
+npm run lint
+npm run build
+```
+
+To serve the production build with the Express API:
+
+```sh
+NODE_ENV=production npm start
+```

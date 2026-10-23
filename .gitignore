@@ -25,3 +25,13 @@ replay_pid*
 
 # Kotlin Gradle plugin data, see https://kotlinlang.org/docs/whatsnew20.html#new-directory-for-kotlin-data-in-gradle-projects
 .kotlin/
+
+# Node.js
+node_modules/
+dist/
+npm-debug.log*
+
+# Local environment files
+.env
+.env.*
+!.env.example
