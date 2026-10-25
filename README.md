@@ -34,3 +34,5 @@ To serve the production build with the Express API:
 ```sh
 NODE_ENV=production npm start
 ```
+
+`npm start` builds the frontend before launching the server. In production, the server also builds the frontend if `dist/index.html` is missing, preventing startup with a broken SPA route when a deployment omits the build step.

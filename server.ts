@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
+import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
@@ -546,9 +547,18 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
+    const distPath = path.resolve(__dirname, 'dist');
+    const indexPath = path.join(distPath, 'index.html');
+
+    if (!existsSync(indexPath)) {
+      console.warn('Production frontend build is missing; building it before starting the server.');
+      const { build } = await import('vite');
+      await build({ root: __dirname, configFile: path.resolve(__dirname, 'vite.config.ts') });
+    }
+
+    app.use(express.static(distPath));
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+      res.sendFile(indexPath);
     });
   }
 
