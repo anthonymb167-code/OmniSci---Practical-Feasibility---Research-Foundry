@@ -17,6 +17,7 @@ import {
   BookOpen,
 } from 'lucide-react';
 import { ScientificProject, ScientificDiscipline } from '../types/scientific';
+import { readAiResponse } from '../utils/billingEvents';
 
 interface UniversalIngestionHubProps {
   onProjectCreated: (project: ScientificProject) => void;
@@ -191,7 +192,7 @@ export const UniversalIngestionHub: React.FC<UniversalIngestionHubProps> = ({
         }),
       });
 
-      const result = await response.json();
+      const result = await readAiResponse<any>(response);
       if (!result.success || !result.data) {
         throw new Error(result.errorNotice || 'Failed to simulate feasibility roadmap');
       }

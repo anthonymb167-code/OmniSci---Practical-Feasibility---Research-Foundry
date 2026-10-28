@@ -24,6 +24,7 @@ import { BiometricSecurityGuard } from './components/BiometricSecurityGuard';
 import { UniversalIngestionHub } from './components/UniversalIngestionHub';
 import { ProjectWorkspace } from './components/ProjectWorkspace';
 import { NotesAndToolsHub } from './components/NotesAndToolsHub';
+import { BillingPanel } from './components/BillingPanel';
 
 export default function App() {
   // Load saved projects from localStorage or default to SEED_PROJECTS
@@ -321,6 +322,8 @@ export default function App() {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        <BillingPanel />
+
         {/* Project Switcher Shelf (visible in workspace mode) */}
         {activeTab === 'workspace' && (
           <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3 text-xs">

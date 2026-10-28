@@ -15,6 +15,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import { ScientificProject, ScientificNote } from '../types/scientific';
+import { readAiResponse } from '../utils/billingEvents';
 
 interface NotesAndToolsHubProps {
   projects: ScientificProject[];
@@ -125,7 +126,7 @@ export const NotesAndToolsHub: React.FC<NotesAndToolsHubProps> = ({
             activeProjects: projects.map((p) => ({ id: p.id, title: p.title, discipline: p.discipline })),
           }),
         });
-        const result = await res.json();
+        const result = await readAiResponse<any>(res);
         if (result.success && result.data) {
           setSynthesisOutput(result.data);
           if (result.data.suggestedProjectId) {
@@ -180,7 +181,7 @@ export const NotesAndToolsHub: React.FC<NotesAndToolsHubProps> = ({
           languageOrEra: sourceEra,
         }),
       });
-      const data = await res.json();
+      const data = await readAiResponse<any>(res);
       if (data.success && data.data) {
         setHistoricalTranslationResult(data.data);
       }

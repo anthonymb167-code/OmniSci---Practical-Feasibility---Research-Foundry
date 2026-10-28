@@ -17,6 +17,7 @@ import {
   VolumeX,
 } from 'lucide-react';
 import { BiometricSecurityState, ScientificProject, ScientificNote } from '../types/scientific';
+import { readAiResponse } from '../utils/billingEvents';
 
 interface BiometricSecurityGuardProps {
   securityState: BiometricSecurityState;
@@ -405,7 +406,7 @@ export const BiometricSecurityGuard: React.FC<BiometricSecurityGuardProps> = ({
             activeProjects: projects.map((p) => ({ id: p.id, title: p.title, discipline: p.discipline })),
           }),
         });
-        const result = await res.json();
+        const result = await readAiResponse<any>(res);
         if (result.success && result.data) {
           setSynthesizedResult(result.data);
           if (result.data.suggestedProjectId) {

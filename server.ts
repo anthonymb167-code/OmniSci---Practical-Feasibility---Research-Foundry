@@ -4,6 +4,7 @@ import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
+import { billingPool, createBillingRouter, initializeBillingDatabase, requireCredits } from './server/billing';
 
 dotenv.config({ path: ['.env.local', '.env'] });
 
@@ -12,8 +13,16 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+app.set('trust proxy', 1);
 
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({
+  limit: '25mb',
+  verify: (req, _res, body) => {
+    if (req.url === '/api/webhooks/dodo') {
+      (req as Request & { rawBody?: string }).rawBody = body.toString('utf8');
+    }
+  },
+}));
 
 // Initialize GoogleGenAI SDK safely
 let ai: GoogleGenAI | null = null;
@@ -34,11 +43,14 @@ app.get('/api/health', (_req: Request, res: Response) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     geminiConfigured: !!process.env.GEMINI_API_KEY,
+    billingConfigured: !!billingPool,
   });
 });
 
+app.use('/api', createBillingRouter());
+
 // Scientific feasibility and practical translation endpoint
-app.post('/api/feasibility/analyze', async (req: Request, res: Response) => {
+app.post('/api/feasibility/analyze', requireCredits(2, { freeTierAllowed: false }), async (req: Request, res: Response) => {
   try {
     const {
       title,
@@ -184,18 +196,12 @@ Generate JSON with the following structure:
     return res.json({ success: true, data: fallbackData, isFallback: !ai });
   } catch (error: any) {
     console.error('Feasibility analysis error:', error);
-    const fallbackData = generateFallbackFeasibility(req.body);
-    return res.json({
-      success: true,
-      data: fallbackData,
-      isFallback: true,
-      errorNotice: error.message,
-    });
+    return res.status(502).json({ error: 'AI analysis failed. Reserved credits will be restored.' });
   }
 });
 
 // Historical manuscript & polyglot scientific translator endpoint
-app.post('/api/historical/translate', async (req: Request, res: Response) => {
+app.post('/api/historical/translate', requireCredits(2, { freeTierAllowed: false }), async (req: Request, res: Response) => {
   try {
     const { sourceText, languageOrEra, domain } = req.body;
 
@@ -285,12 +291,12 @@ Return JSON format:
     });
   } catch (error: any) {
     console.error('Translation error:', error);
-    return res.status(500).json({ error: error.message });
+    return res.status(502).json({ error: 'AI translation failed. Reserved credits will be restored.' });
   }
 });
 
 // Audio & written notes incorporation engine
-app.post('/api/notes/synthesize', async (req: Request, res: Response) => {
+app.post('/api/notes/synthesize', requireCredits(1, { freeTierAllowed: true }), async (req: Request, res: Response) => {
   try {
     const { noteContent, activeProjects } = req.body;
 
@@ -353,7 +359,7 @@ Return JSON:
     });
   } catch (error: any) {
     console.error('Notes synthesis error:', error);
-    return res.status(500).json({ error: error.message });
+    return res.status(502).json({ error: 'AI synthesis failed. Reserved credits will be restored.' });
   }
 });
 
@@ -539,6 +545,13 @@ function generateFallbackFeasibility(payload: any) {
 
 // Development Vite integration or Production static files
 async function startServer() {
+  if (billingPool) {
+    await initializeBillingDatabase();
+    console.log('Billing database schema is ready.');
+  } else {
+    console.warn('DATABASE_URL is not configured; account, payment, and paid AI routes will remain unavailable.');
+  }
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
