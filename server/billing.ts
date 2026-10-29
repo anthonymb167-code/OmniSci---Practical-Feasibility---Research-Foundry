@@ -20,6 +20,7 @@ const ROLLOVER_CAP = 3000;
 const FREE_MONTHLY_CREDITS = 50;
 const MONTHLY_CREDITS = 10000;
 const YEARLY_CREDITS = 13500;
+const INVITATION_DURATION_DAYS = 7;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -305,7 +306,29 @@ async function getAccount(user: BillingUser) {
     subscription: subscription ?? { plan: 'free', status: 'inactive', accessExpiresAt: null, isPaid: false },
     credits,
     totalCredits: credits.subscription + credits.rollover + credits.booster,
+    canManageInvitations: Boolean(
+      process.env.INVITE_ADMIN_EMAIL?.trim() &&
+      user.email.toLowerCase() === process.env.INVITE_ADMIN_EMAIL.trim().toLowerCase()
+    ),
   };
+}
+
+async function getInvitationAdmin(req: Request, res: Response): Promise<BillingUser | null> {
+  const user = await getSessionUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'Sign in to manage invitations.' });
+    return null;
+  }
+  const adminEmail = process.env.INVITE_ADMIN_EMAIL?.trim().toLowerCase();
+  if (!adminEmail) {
+    res.status(503).json({ error: 'Invitation management is not configured.' });
+    return null;
+  }
+  if (user.email.toLowerCase() !== adminEmail) {
+    res.status(403).json({ error: 'Only the configured invitation administrator can manage invitations.' });
+    return null;
+  }
+  return user;
 }
 
 function requireDatabase(_req: Request, res: Response, next: NextFunction): void {
@@ -377,6 +400,150 @@ function getCycleEnd(data: Record<string, any>, plan: ProductPlan): Date {
 function getPaymentAmount(data: Record<string, any>): number | null {
   const amount = data.total_amount ?? data.amount;
   return Number.isSafeInteger(amount) && amount >= 0 ? amount : null;
+}
+
+function getPlanPriceInCents(plan: ProductPlan): number {
+  const match = /^\$(\d+(?:\.\d{1,2})?)/.exec(plan.price);
+  if (!match) throw new Error(`Could not determine the configured USD price for plan ${plan.key}.`);
+  return Math.round(Number(match[1]) * 100);
+}
+
+interface RefundQuote {
+  eligible: boolean;
+  reason?: string;
+  paymentAmount: number;
+  requestedAmount: number;
+  availableAmount: number;
+  consumedCredits: number;
+  consumedValue: number;
+  deduction: number;
+  approvedAmount: number;
+}
+
+async function calculateRefundQuote(
+  client: PoolClient,
+  environment: BillingEnvironment,
+  userId: string,
+  paymentId: string,
+  requestedAmount: number
+): Promise<RefundQuote> {
+  const paymentResult = await client.query<{
+    total_amount: string | null;
+    currency: string | null;
+    product_id: string | null;
+    created_at: Date;
+  }>(
+    `SELECT total_amount::text, currency, product_id, created_at
+     FROM billing_payments
+     WHERE environment = $1 AND payment_id = $2 AND user_id = $3`,
+    [environment, paymentId, userId]
+  );
+  const payment = paymentResult.rows[0];
+  if (!payment || !payment.total_amount || payment.currency !== 'USD') {
+    throw new Error('This payment is unavailable for automatic refund processing.');
+  }
+  const paymentAmount = Number(payment.total_amount);
+  if (!Number.isSafeInteger(paymentAmount) || paymentAmount <= 0) {
+    throw new Error('The recorded payment amount is invalid.');
+  }
+  const plan = plans.find((candidate) => candidate.productId === payment.product_id);
+  if (!plan) throw new Error('The payment product has no configured refund credit value.');
+  const planPriceCents = getPlanPriceInCents(plan);
+
+  const grantResult = await client.query<{
+    id: string;
+    granted: string;
+    bucket: string;
+  }>(
+    `SELECT id, granted::text, bucket
+     FROM credit_grants
+     WHERE environment = $1 AND user_id = $2 AND external_payment_id = $3
+       AND bucket IN ('booster', 'subscription', 'rollover')
+     ORDER BY id
+     FOR UPDATE`,
+    [environment, userId, paymentId]
+  );
+  const grantIds = grantResult.rows.map((grant) => grant.id);
+  const grantedCredits = grantResult.rows.reduce(
+    (total, grant) => total + (grant.bucket === 'rollover' ? 0 : Number(grant.granted)),
+    0
+  );
+  if (grantIds.length === 0 || grantedCredits <= 0) {
+    throw new Error('No matching credit grant was found for this payment.');
+  }
+
+  const consumedResult = await client.query<{ credits: string }>(
+    `SELECT COALESCE(SUM((allocation->>'amount')::bigint), 0)::text AS credits
+     FROM credit_reservations reservation
+     CROSS JOIN LATERAL jsonb_array_elements(reservation.allocations) AS allocation
+     WHERE reservation.environment = $1
+       AND reservation.user_id = $2
+       AND reservation.status = 'committed'
+       AND allocation->>'grantId' = ANY($3::text[])`,
+    [environment, userId, grantIds]
+  );
+  const consumedCredits = Number(consumedResult.rows[0]?.credits ?? 0);
+  const consumedValue = Math.ceil((consumedCredits * planPriceCents) / plan.credits);
+  const legacyRolloverResult = plan.kind === 'subscription'
+    ? await client.query<{ found: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM credit_grants
+         WHERE environment = $1 AND user_id = $2 AND bucket = 'rollover'
+           AND external_payment_id IS NULL AND created_at >= $3
+       ) AS found`,
+      [environment, userId, payment.created_at]
+    )
+    : null;
+  const refundTotals = await client.query<{ amount: string; deductions: string }>(
+    `SELECT
+       COALESCE((
+         SELECT SUM(amount) FROM billing_refunds
+         WHERE environment = $1 AND payment_id = $2 AND status IN ('processed', 'needs_review')
+       ), 0)::text AS amount,
+       COALESCE((
+         SELECT SUM(consumption_deduction) FROM billing_refund_requests
+         WHERE environment = $1 AND payment_id = $2 AND status IN ('submitted', 'processed')
+       ), 0)::text AS deductions`,
+    [environment, paymentId]
+  );
+  const pendingTotal = await client.query<{ amount: string }>(
+    `SELECT COALESCE(SUM(approved_amount), 0)::text AS amount
+     FROM billing_refund_requests
+     WHERE environment = $1 AND payment_id = $2
+       AND status IN ('submitting', 'submitted', 'needs_review')`,
+    [environment, paymentId]
+  );
+  const alreadyRefunded = Number(refundTotals.rows[0]?.amount ?? 0);
+  const reservedAmount = Number(pendingTotal.rows[0]?.amount ?? 0);
+  const availableAmount = Math.max(0, paymentAmount - alreadyRefunded - reservedAmount);
+  const previouslyDeducted = Number(refundTotals.rows[0]?.deductions ?? 0);
+  const deduction = Math.max(0, consumedValue - previouslyDeducted);
+  const approvedAmount = requestedAmount - deduction;
+
+  let reason: string | undefined;
+  if (!Number.isSafeInteger(requestedAmount) || requestedAmount <= 0) {
+    reason = 'Enter a refund amount greater than zero.';
+  } else if (requestedAmount > availableAmount) {
+    reason = 'The requested amount exceeds the refundable balance for this payment.';
+  } else if (consumedValue >= requestedAmount) {
+    reason = 'The value of credits already consumed is at least the requested refund amount.';
+  } else if (approvedAmount <= 0) {
+    reason = 'There is no refundable amount after deducting the value of credits consumed.';
+  } else if (legacyRolloverResult?.rows[0]?.found) {
+    reason = 'Some rollover credits cannot be linked to this payment, so support must review the refund.';
+  }
+
+  return {
+    eligible: !reason,
+    reason,
+    paymentAmount,
+    requestedAmount,
+    availableAmount,
+    consumedCredits,
+    consumedValue,
+    deduction,
+    approvedAmount: reason ? 0 : approvedAmount,
+  };
 }
 
 async function insertGrant(
@@ -451,11 +618,12 @@ async function processSubscriptionEvent(
   if (typeof data.payment_id === 'string') {
     await client.query(
       `INSERT INTO billing_payments
-         (environment, payment_id, user_id, total_amount, currency, subscription_id, service_period_end)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+         (environment, payment_id, user_id, total_amount, currency, product_id, subscription_id, service_period_end)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (environment, payment_id) DO UPDATE SET
          total_amount = COALESCE(EXCLUDED.total_amount, billing_payments.total_amount),
          currency = COALESCE(EXCLUDED.currency, billing_payments.currency),
+         product_id = COALESCE(EXCLUDED.product_id, billing_payments.product_id),
          subscription_id = COALESCE(EXCLUDED.subscription_id, billing_payments.subscription_id),
          service_period_end = COALESCE(EXCLUDED.service_period_end, billing_payments.service_period_end)`,
       [
@@ -464,6 +632,7 @@ async function processSubscriptionEvent(
         userId,
         getPaymentAmount(data),
         typeof data.currency === 'string' ? data.currency : null,
+        productId,
         subscriptionId,
         cycleEnd,
       ]
@@ -507,14 +676,23 @@ async function processSubscriptionEvent(
   );
 
   if (eventType === 'subscription.active' || eventType === 'subscription.renewed') {
-    const currentSubscriptionCredits = await client.query<{ credits: string }>(
-      `SELECT COALESCE(SUM(remaining), 0)::text AS credits
+    const currentSubscriptionCredits = await client.query<{
+      id: string;
+      remaining: string;
+      external_payment_id: string | null;
+    }>(
+      `SELECT id, remaining::text, external_payment_id
        FROM credit_grants
        WHERE environment = $1 AND user_id = $2 AND bucket = 'subscription'
-         AND remaining > 0 AND revoked_at IS NULL`,
+         AND remaining > 0 AND revoked_at IS NULL
+       ORDER BY created_at, id
+       FOR UPDATE`,
       [environment, userId]
     );
-    const unusedSubscriptionCredits = Number(currentSubscriptionCredits.rows[0]?.credits ?? 0);
+    const unusedSubscriptionCredits = currentSubscriptionCredits.rows.reduce(
+      (total, grant) => total + Number(grant.remaining),
+      0
+    );
 
     await client.query(
       `UPDATE credit_grants SET remaining = 0
@@ -531,14 +709,21 @@ async function processSubscriptionEvent(
     }
 
     if (eventType === 'subscription.renewed' && plan.key === 'monthly' && unusedSubscriptionCredits > 0) {
-      await insertGrant(client, {
-        userId,
-        environment,
-        bucket: 'rollover',
-        credits: Math.min(unusedSubscriptionCredits, ROLLOVER_CAP),
-        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        sourceEventId: `${eventId}:rollover`,
-      });
+      let rolloverCreditsAvailable = ROLLOVER_CAP;
+      for (const grant of currentSubscriptionCredits.rows) {
+        const credits = Math.min(Number(grant.remaining), rolloverCreditsAvailable);
+        if (credits <= 0) break;
+        await insertGrant(client, {
+          userId,
+          environment,
+          bucket: 'rollover',
+          credits,
+          expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          sourceEventId: `${eventId}:rollover:${grant.id}`,
+          paymentId: grant.external_payment_id ?? undefined,
+        });
+        rolloverCreditsAvailable -= credits;
+      }
     }
 
     const paymentId =
@@ -580,8 +765,9 @@ async function applyRefund(
     user_id: string;
     total_amount: string | null;
     currency: string | null;
+    created_at: Date;
   }>(
-    `SELECT user_id, total_amount::text, currency
+    `SELECT user_id, total_amount::text, currency, created_at
      FROM billing_payments WHERE environment = $1 AND payment_id = $2 FOR UPDATE`,
     [environment, paymentId]
   );
@@ -591,14 +777,28 @@ async function applyRefund(
     granted: string;
     remaining: string;
     refunded_credits: string;
+    bucket: string;
   }>(
-    `SELECT id, granted::text, remaining::text, refunded_credits::text
+    `SELECT id, granted::text, remaining::text, refunded_credits::text, bucket
      FROM credit_grants
      WHERE environment = $1 AND external_payment_id = $2
-       AND bucket IN ('booster', 'subscription')
+       AND bucket IN ('booster', 'subscription', 'rollover')
      FOR UPDATE`,
     [environment, paymentId]
   );
+  const paidGrantRows = grantResult.rows.filter((grant) => grant.bucket !== 'rollover');
+  const rolloverGrantRows = grantResult.rows.filter((grant) => grant.bucket === 'rollover');
+  const legacyRolloverResult = payment
+    ? await client.query<{ found: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM credit_grants
+         WHERE environment = $1 AND user_id = $2 AND bucket = 'rollover'
+           AND external_payment_id IS NULL AND created_at >= $3
+       ) AS found`,
+      [environment, payment.user_id, payment.created_at]
+    )
+    : null;
+  const hasLegacyRollover = Boolean(legacyRolloverResult?.rows[0]?.found);
 
   const isPartial = data.is_partial === true;
   const reportedAmount = getPaymentAmount(data);
@@ -609,7 +809,7 @@ async function applyRefund(
   const currencyMismatch = Boolean(payment?.currency && refundCurrency && payment.currency !== refundCurrency);
   const amountExceedsPurchase = paymentAmount !== null && reportedAmount !== null && reportedAmount > paymentAmount;
 
-  if (payment && !currencyMismatch && paymentAmount !== null && paymentAmount > 0 &&
+  if (payment && paidGrantRows.length > 0 && !hasLegacyRollover && !currencyMismatch && paymentAmount !== null && paymentAmount > 0 &&
       !amountExceedsPurchase && (reportedAmount !== null || !isPartial)) {
     const refundAmount = isPartial ? reportedAmount : paymentAmount;
     if (refundAmount === null || refundAmount <= 0) {
@@ -634,16 +834,16 @@ async function applyRefund(
     );
     const cumulativeRefundAmount = Math.min(Number(cumulative.rows[0]?.amount ?? 0), paymentAmount);
     let creditsRemoved = 0;
-    let creditsShortfall = 0;
+    let rolloverDemand = 0;
 
-    for (const grant of grantResult.rows) {
+    for (const grant of paidGrantRows) {
       const granted = Number(grant.granted);
       const alreadyRefunded = Number(grant.refunded_credits);
       const targetRefunded = Math.min(granted, Math.floor((granted * cumulativeRefundAmount) / paymentAmount));
       const additionalTarget = Math.max(0, targetRefunded - alreadyRefunded);
       const remaining = Number(grant.remaining);
       const removed = Math.min(remaining, additionalTarget);
-      const shortfall = additionalTarget - removed;
+      rolloverDemand += additionalTarget - removed;
       await client.query(
         `UPDATE credit_grants
          SET remaining = remaining - $1,
@@ -653,13 +853,36 @@ async function applyRefund(
         [removed, targetRefunded, environment, grant.id]
       );
       creditsRemoved += removed;
-      creditsShortfall += shortfall;
     }
+
+    for (const grant of rolloverGrantRows) {
+      if (rolloverDemand <= 0) break;
+      const granted = Number(grant.granted);
+      const alreadyRefunded = Number(grant.refunded_credits);
+      const removed = Math.min(Number(grant.remaining), rolloverDemand);
+      const targetRefunded = Math.min(granted, alreadyRefunded + removed);
+      await client.query(
+        `UPDATE credit_grants
+         SET remaining = remaining - $1,
+             refunded_credits = $2,
+             revoked_at = CASE WHEN $2 >= granted THEN NOW() ELSE revoked_at END
+         WHERE environment = $3 AND id = $4`,
+        [removed, targetRefunded, environment, grant.id]
+      );
+      rolloverDemand -= removed;
+      creditsRemoved += removed;
+    }
+    const creditsShortfall = rolloverDemand;
 
     await client.query(
       `UPDATE billing_refunds SET credits_removed = $1, credits_shortfall = $2
        WHERE environment = $3 AND refund_id = $4`,
       [creditsRemoved, creditsShortfall, environment, refundId]
+    );
+    await client.query(
+      `UPDATE billing_refund_requests SET status = 'processed', updated_at = NOW()
+       WHERE environment = $1 AND provider_refund_id = $2`,
+      [environment, refundId]
     );
     console.info(
       `Dodo refund credit adjustment paymentId=${paymentId} refundId=${refundId} creditsRemoved=${creditsRemoved} creditsShortfall=${creditsShortfall}`
@@ -674,8 +897,13 @@ async function applyRefund(
      ON CONFLICT (environment, refund_id) DO NOTHING`,
     [environment, refundId, paymentId, reportedAmount, refundCurrency]
   );
+  await client.query(
+    `UPDATE billing_refund_requests SET status = 'needs_review', updated_at = NOW()
+     WHERE environment = $1 AND provider_refund_id = $2`,
+    [environment, refundId]
+  );
 
-  if (!isPartial && grantResult.rows.length > 0 && !currencyMismatch && !amountExceedsPurchase) {
+  if (!isPartial && paidGrantRows.length > 0 && !hasLegacyRollover && !currencyMismatch && !amountExceedsPurchase) {
     let creditsRemoved = 0;
     let creditsShortfall = 0;
     for (const grant of grantResult.rows) {
@@ -700,6 +928,11 @@ async function applyRefund(
        WHERE environment = $3 AND refund_id = $4`,
       [creditsRemoved, creditsShortfall, environment, refundId]
     );
+    await client.query(
+      `UPDATE billing_refund_requests SET status = 'processed', updated_at = NOW()
+       WHERE environment = $1 AND provider_refund_id = $2`,
+      [environment, refundId]
+    );
     console.info(
       `Dodo full refund credit adjustment paymentId=${paymentId} refundId=${refundId} creditsRemoved=${creditsRemoved} creditsShortfall=${creditsShortfall}`
     );
@@ -707,7 +940,7 @@ async function applyRefund(
   }
 
   console.error(
-    `Dodo refund needs manual credit review paymentId=${paymentId} refundId=${refundId} reason=${currencyMismatch ? 'currency_mismatch' : amountExceedsPurchase ? 'refund_amount_exceeds_purchase' : isPartial ? 'partial_refund_missing_purchase_amount' : 'purchase_or_credit_grant_not_found'}`
+    `Dodo refund needs manual credit review paymentId=${paymentId} refundId=${refundId} reason=${hasLegacyRollover ? 'legacy_rollover_unattributed' : currencyMismatch ? 'currency_mismatch' : amountExceedsPurchase ? 'refund_amount_exceeds_purchase' : isPartial ? 'partial_refund_missing_purchase_amount' : 'purchase_or_credit_grant_not_found'}`
   );
 }
 
@@ -737,12 +970,13 @@ async function processDodoEvent(
           : null;
       await client.query(
         `INSERT INTO billing_payments
-           (environment, payment_id, user_id, total_amount, currency, subscription_id, service_period_end)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (environment, payment_id, user_id, total_amount, currency, product_id, subscription_id, service_period_end)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (environment, payment_id) DO UPDATE SET
            total_amount = COALESCE(EXCLUDED.total_amount, billing_payments.total_amount),
            currency = COALESCE(EXCLUDED.currency, billing_payments.currency),
-           subscription_id = COALESCE(EXCLUDED.subscription_id, billing_payments.subscription_id),
+             product_id = COALESCE(EXCLUDED.product_id, billing_payments.product_id),
+             subscription_id = COALESCE(EXCLUDED.subscription_id, billing_payments.subscription_id),
            service_period_end = COALESCE(EXCLUDED.service_period_end, billing_payments.service_period_end)`,
         [
           environment,
@@ -750,6 +984,7 @@ async function processDodoEvent(
           userId,
           getPaymentAmount(data),
           typeof data.currency === 'string' ? data.currency : null,
+          productId,
           typeof servicePeriod?.subscription_id === 'string' ? servicePeriod.subscription_id : null,
           servicePeriodEnd,
         ]
@@ -785,6 +1020,15 @@ async function processDodoEvent(
 
   if (eventType === 'refund.succeeded') {
     await applyRefund(client, environment, data);
+    return;
+  }
+
+  if (eventType === 'refund.failed' && typeof data.refund_id === 'string') {
+    await client.query(
+      `UPDATE billing_refund_requests SET status = 'failed', updated_at = NOW()
+       WHERE environment = $1 AND provider_refund_id = $2 AND status IN ('submitted', 'needs_review')`,
+      [environment, data.refund_id]
+    );
   }
 }
 
@@ -809,6 +1053,18 @@ export function createBillingRouter(): Router {
     standardHeaders: 'draft-8',
     legacyHeaders: false,
   });
+  const refundRateLimit = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 5,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+  });
+  const invitationRateLimit = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 10,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+  });
 
   router.get('/billing/plans', (_req, res) => {
     res.json({
@@ -827,8 +1083,14 @@ export function createBillingRouter(): Router {
   router.post('/auth/register', requireDatabase, registrationRateLimit, requireSameOrigin, asyncRoute(async (req, res) => {
     const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
     const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const rawInvitationToken = req.body.inviteToken;
+    const invitationToken = typeof rawInvitationToken === 'string' ? rawInvitationToken : '';
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 12 || password.length > 128) {
       res.status(400).json({ error: 'Enter a valid email and a password between 12 and 128 characters.' });
+      return;
+    }
+    if ((rawInvitationToken !== undefined && typeof rawInvitationToken !== 'string') || invitationToken.length > 200) {
+      res.status(400).json({ error: 'This invitation link is invalid or expired.' });
       return;
     }
     const appUrl = process.env.APP_URL;
@@ -846,6 +1108,23 @@ export function createBillingRouter(): Router {
     let userId: string;
     try {
       await client.query('BEGIN');
+      let invitationId: string | null = null;
+      if (invitationToken) {
+        const invitation = await client.query<{ id: string; email: string }>(
+          `SELECT id, email FROM account_invitations
+           WHERE token_hash = $1 AND expires_at > NOW()
+             AND redeemed_at IS NULL AND revoked_at IS NULL
+           FOR UPDATE`,
+          [hashToken(invitationToken)]
+        );
+        if (!invitation.rows[0] || invitation.rows[0].email.toLowerCase() !== email) {
+          await client.query('ROLLBACK');
+          res.status(400).json({ error: 'This invitation is invalid, expired, or was issued to a different email address.' });
+          return;
+        }
+        invitationId = invitation.rows[0].id;
+      }
+
       const passwordHash = await hashPassword(password);
       const result = await client.query<{ id: string; email: string }>(
         `INSERT INTO users (id, email, password_hash, email_verified)
@@ -856,9 +1135,9 @@ export function createBillingRouter(): Router {
       userId = result.rows[0].id;
       const verificationToken = randomBytes(32).toString('base64url');
       await client.query(
-        `INSERT INTO email_verifications (token_hash, user_id, expires_at)
-         VALUES ($1, $2, NOW() + INTERVAL '24 hours')`,
-        [hashToken(verificationToken), userId]
+        `INSERT INTO email_verifications (token_hash, user_id, expires_at, invitation_id)
+         VALUES ($1, $2, NOW() + INTERVAL '24 hours', $3)`,
+        [hashToken(verificationToken), userId, invitationId]
       );
 
       const transporter = nodemailer.createTransport({
@@ -901,10 +1180,10 @@ export function createBillingRouter(): Router {
     let user: BillingUser | undefined;
     try {
       await client.query('BEGIN');
-      const result = await client.query<{ user_id: string }>(
+      const result = await client.query<{ user_id: string; invitation_id: string | null }>(
         `DELETE FROM email_verifications
          WHERE token_hash = $1 AND expires_at > NOW()
-         RETURNING user_id`,
+         RETURNING user_id, invitation_id`,
         [hashToken(token)]
       );
       if (!result.rows[0]) {
@@ -919,6 +1198,13 @@ export function createBillingRouter(): Router {
          RETURNING id, email`,
         [result.rows[0].user_id]
       );
+      if (result.rows[0].invitation_id) {
+        await client.query(
+          `UPDATE account_invitations SET redeemed_at = NOW()
+           WHERE id = $1 AND redeemed_at IS NULL AND revoked_at IS NULL`,
+          [result.rows[0].invitation_id]
+        );
+      }
       user = updated.rows[0];
       await client.query('COMMIT');
     } catch (error) {
@@ -964,6 +1250,181 @@ export function createBillingRouter(): Router {
     res.status(204).end();
   }));
 
+  router.get('/invitations', requireDatabase, asyncRoute(async (req, res) => {
+    const admin = await getInvitationAdmin(req, res);
+    if (!admin) return;
+
+    const result = await billingPool!.query<{
+      id: string;
+      email: string;
+      created_at: Date;
+      expires_at: Date;
+      redeemed_at: Date | null;
+      revoked_at: Date | null;
+    }>(
+      `SELECT id, email, created_at, expires_at, redeemed_at, revoked_at
+       FROM account_invitations
+       WHERE created_by = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [admin.id]
+    );
+    res.json({
+      invitations: result.rows.map((invitation) => ({
+        id: invitation.id,
+        email: invitation.email,
+        createdAt: invitation.created_at.toISOString(),
+        expiresAt: invitation.expires_at.toISOString(),
+        status: invitation.redeemed_at
+          ? 'redeemed'
+          : invitation.revoked_at
+            ? 'revoked'
+            : invitation.expires_at.getTime() <= Date.now()
+              ? 'expired'
+              : 'pending',
+      })),
+    });
+  }));
+
+  router.post('/invitations', requireDatabase, invitationRateLimit, requireSameOrigin, asyncRoute(async (req, res) => {
+    const admin = await getInvitationAdmin(req, res);
+    if (!admin) return;
+
+    const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const sendEmail = req.body.sendEmail;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || typeof sendEmail !== 'boolean') {
+      res.status(400).json({ error: 'Enter a valid email address and choose whether to send the invitation by email.' });
+      return;
+    }
+
+    const appUrl = process.env.APP_URL;
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPassword = process.env.SMTP_PASSWORD;
+    const smtpFrom = process.env.SMTP_FROM;
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    if (!appUrl) {
+      res.status(503).json({ error: 'The app URL is not configured for invitation links.' });
+      return;
+    }
+    if (sendEmail && (!smtpHost || !smtpUser || !smtpPassword || !smtpFrom || !Number.isInteger(smtpPort))) {
+      res.status(503).json({ error: 'Email delivery is not configured. Turn off email delivery to create a copyable invite link.' });
+      return;
+    }
+
+    let appBaseUrl: URL;
+    try {
+      appBaseUrl = new URL(appUrl);
+    } catch {
+      res.status(503).json({ error: 'The configured app URL is invalid.' });
+      return;
+    }
+    if (!['https:', 'http:'].includes(appBaseUrl.protocol) ||
+        (process.env.NODE_ENV === 'production' && appBaseUrl.protocol !== 'https:')) {
+      res.status(503).json({ error: 'Invitation links must use the app’s public HTTPS URL.' });
+      return;
+    }
+
+    const invitationId = randomUUID();
+    const token = randomBytes(32).toString('base64url');
+    const inviteUrl = new URL('/', appBaseUrl);
+    inviteUrl.searchParams.set('invite', token);
+    const client = await billingPool!.connect();
+    let expiresAt: Date;
+    try {
+      await client.query('BEGIN');
+      const existingAccount = await client.query(
+        'SELECT 1 FROM users WHERE email = $1',
+        [email]
+      );
+      if (existingAccount.rows.length > 0) {
+        await client.query('ROLLBACK');
+        res.status(409).json({ error: 'That email already has an account and does not need an invitation.' });
+        return;
+      }
+      await client.query(
+        `UPDATE account_invitations
+         SET revoked_at = NOW()
+         WHERE LOWER(email) = $1 AND redeemed_at IS NULL AND revoked_at IS NULL`,
+        [email]
+      );
+      const insertedInvitation = await client.query<{ expires_at: Date }>(
+        `INSERT INTO account_invitations (id, token_hash, email, created_by, expires_at)
+         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '7 days')
+         RETURNING expires_at`,
+        [invitationId, hashToken(token), email, admin.id]
+      );
+      expiresAt = insertedInvitation.rows[0].expires_at;
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    if (sendEmail) {
+      try {
+        const transporter = nodemailer.createTransport({
+          host: smtpHost!,
+          port: smtpPort,
+          secure: smtpPort === 465,
+          auth: { user: smtpUser!, pass: smtpPassword! },
+        });
+        await transporter.sendMail({
+          from: smtpFrom!,
+          to: email,
+          subject: 'You’re invited to OmniSci Foundry',
+          text: `You have been invited to try OmniSci Foundry. Register using this email address within ${INVITATION_DURATION_DAYS} days: ${inviteUrl.toString()}`,
+          html: `<p>You have been invited to try OmniSci Foundry.</p><p>Register using this email address within ${INVITATION_DURATION_DAYS} days:</p><p><a href="${inviteUrl.toString()}">Accept invitation</a></p>`,
+        });
+      } catch (error) {
+        await billingPool!.query(
+          `UPDATE account_invitations SET revoked_at = NOW()
+           WHERE id = $1 AND redeemed_at IS NULL`,
+          [invitationId]
+        );
+        console.error(`Invitation email delivery failed invitationId=${invitationId}`);
+        captureServerError(error, 'invitation-email');
+        res.status(502).json({ error: 'The invitation email could not be sent. The link was not activated; try again or create a copyable link.' });
+        return;
+      }
+    }
+
+    res.status(201).json({
+      invitation: {
+        id: invitationId,
+        email,
+        expiresAt: expiresAt.toISOString(),
+        status: 'pending',
+      },
+      inviteUrl: inviteUrl.toString(),
+      emailSent: sendEmail,
+    });
+  }));
+
+  router.delete('/invitations/:id', requireDatabase, requireSameOrigin, asyncRoute(async (req, res) => {
+    const admin = await getInvitationAdmin(req, res);
+    if (!admin) return;
+    const invitationId = req.params.id;
+    if (!invitationId || invitationId.length > 80) {
+      res.status(400).json({ error: 'Provide a valid invitation ID.' });
+      return;
+    }
+    const result = await billingPool!.query(
+      `UPDATE account_invitations SET revoked_at = NOW()
+       WHERE id = $1 AND created_by = $2
+         AND redeemed_at IS NULL AND revoked_at IS NULL
+       RETURNING id`,
+      [invitationId, admin.id]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Invitation not found or it can no longer be revoked.' });
+      return;
+    }
+    res.status(204).end();
+  }));
+
   router.get('/billing/account', requireDatabase, asyncRoute(async (req, res) => {
     const user = await getSessionUser(req);
     if (!user) {
@@ -971,6 +1432,328 @@ export function createBillingRouter(): Router {
       return;
     }
     res.json(await getAccount(user));
+  }));
+
+  router.get('/billing/payments', requireDatabase, asyncRoute(async (req, res) => {
+    const user = await getSessionUser(req);
+    if (!user) {
+      res.status(401).json({ error: 'Sign in to view your payments.' });
+      return;
+    }
+
+    const result = await billingPool!.query<{
+      payment_id: string;
+      total_amount: string;
+      currency: string;
+      product_id: string | null;
+      created_at: Date;
+      credits_granted: string;
+      credits_consumed: string;
+      refunded_amount: string;
+      pending_amount: string;
+    }>(
+      `SELECT payment.payment_id, payment.total_amount::text, payment.currency, payment.product_id,
+              payment.created_at,
+              COALESCE((
+                SELECT SUM(cg.granted)
+                FROM credit_grants cg
+                WHERE cg.environment = payment.environment
+                  AND cg.external_payment_id = payment.payment_id
+                  AND cg.bucket IN ('booster', 'subscription')
+              ), 0)::text AS credits_granted,
+              COALESCE((
+                SELECT SUM((allocation->>'amount')::bigint)
+                FROM credit_grants cg
+                JOIN credit_reservations reservation
+                  ON reservation.environment = cg.environment
+                 AND reservation.user_id = cg.user_id
+                 AND reservation.status = 'committed'
+                CROSS JOIN LATERAL jsonb_array_elements(reservation.allocations) AS allocation
+                WHERE cg.environment = payment.environment
+                  AND cg.external_payment_id = payment.payment_id
+                  AND cg.bucket IN ('booster', 'subscription', 'rollover')
+                  AND allocation->>'grantId' = cg.id::text
+              ), 0)::text AS credits_consumed,
+              COALESCE((
+                SELECT SUM(refund.amount)
+                FROM billing_refunds refund
+                WHERE refund.environment = payment.environment
+                  AND refund.payment_id = payment.payment_id
+                  AND refund.status IN ('processed', 'needs_review')
+              ), 0)::text AS refunded_amount,
+              COALESCE((
+                SELECT SUM(request.approved_amount)
+                FROM billing_refund_requests request
+                WHERE request.environment = payment.environment
+                  AND request.payment_id = payment.payment_id
+                  AND request.status IN ('submitting', 'submitted', 'needs_review')
+              ), 0)::text AS pending_amount
+       FROM billing_payments payment
+       WHERE payment.environment = $1 AND payment.user_id = $2
+         AND payment.total_amount IS NOT NULL AND payment.currency = 'USD'
+       ORDER BY payment.created_at DESC
+       LIMIT 50`,
+      [BILLING_ENVIRONMENT, user.id]
+    );
+    res.json({
+      payments: result.rows.map((payment) => ({
+        paymentId: payment.payment_id,
+        amount: Number(payment.total_amount),
+        currency: payment.currency,
+        productId: payment.product_id,
+        createdAt: payment.created_at.toISOString(),
+        creditsGranted: Number(payment.credits_granted),
+        creditsConsumed: Number(payment.credits_consumed),
+        refundedAmount: Number(payment.refunded_amount),
+        pendingAmount: Number(payment.pending_amount),
+      })),
+    });
+  }));
+
+  router.post('/billing/refund-quote', requireDatabase, requireSameOrigin, asyncRoute(async (req, res) => {
+    const user = await getSessionUser(req);
+    if (!user) {
+      res.status(401).json({ error: 'Sign in to request a refund.' });
+      return;
+    }
+    const paymentId = typeof req.body.paymentId === 'string' ? req.body.paymentId : '';
+    const requestedAmount = req.body.amount;
+    if (!paymentId || paymentId.length > 200 || !Number.isSafeInteger(requestedAmount)) {
+      res.status(400).json({ error: 'Provide a valid payment ID and refund amount in USD cents.' });
+      return;
+    }
+
+    const client = await billingPool!.connect();
+    try {
+      await client.query('BEGIN');
+      const quote = await calculateRefundQuote(
+        client,
+        BILLING_ENVIRONMENT,
+        user.id,
+        paymentId,
+        requestedAmount
+      );
+      await client.query('COMMIT');
+      res.json(quote);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error instanceof Error && error.message.includes('unavailable for automatic refund')) {
+        res.status(404).json({ error: error.message });
+        return;
+      }
+      if (error instanceof Error && error.message.includes('No matching credit grant')) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
+      if (error instanceof Error && (
+        error.message.includes('product has no configured refund credit value') ||
+        error.message.includes('recorded payment amount is invalid')
+      )) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  router.post('/billing/refunds', requireDatabase, requireSameOrigin, refundRateLimit, asyncRoute(async (req, res) => {
+    const user = await getSessionUser(req);
+    if (!user) {
+      res.status(401).json({ error: 'Sign in to request a refund.' });
+      return;
+    }
+    const paymentId = typeof req.body.paymentId === 'string' ? req.body.paymentId : '';
+    const requestedAmount = req.body.amount;
+    const apiKey = process.env.DODO_PAYMENTS_API_KEY;
+    if (!paymentId || paymentId.length > 200 || !Number.isSafeInteger(requestedAmount) || requestedAmount <= 0) {
+      res.status(400).json({ error: 'Provide a valid payment ID and refund amount in USD cents.' });
+      return;
+    }
+    if (!apiKey) {
+      res.status(503).json({ error: 'Refund processing is not configured.' });
+      return;
+    }
+
+    const client = await billingPool!.connect();
+    const requestId = randomUUID();
+    let quote: RefundQuote;
+    let productId: string;
+    try {
+      await client.query('BEGIN');
+      const payment = await client.query<{ product_id: string | null; currency: string | null }>(
+        `SELECT product_id, currency FROM billing_payments
+         WHERE environment = $1 AND payment_id = $2 AND user_id = $3
+         FOR UPDATE`,
+        [BILLING_ENVIRONMENT, paymentId, user.id]
+      );
+      if (payment.rowCount === 0) {
+        await client.query('ROLLBACK');
+        res.status(404).json({ error: 'Payment not found for this account.' });
+        return;
+      }
+      if (!payment.rows[0].product_id || payment.rows[0].currency !== 'USD') {
+        await client.query('ROLLBACK');
+        res.status(409).json({ error: 'This payment is missing the product or currency details required for an automatic refund.' });
+        return;
+      }
+      productId = payment.rows[0].product_id;
+      const quoteResult = await calculateRefundQuote(
+        client,
+        BILLING_ENVIRONMENT,
+        user.id,
+        paymentId,
+        requestedAmount
+      );
+      if (!quoteResult.eligible) {
+        await client.query('ROLLBACK');
+        console.info(
+          `Dodo refund request denied paymentId=${paymentId} requestedAmount=${requestedAmount} consumedValue=${quoteResult.consumedValue} reason=${quoteResult.reason}`
+        );
+        res.status(422).json(quoteResult);
+        return;
+      }
+      quote = quoteResult;
+      await client.query(
+        `INSERT INTO billing_refund_requests
+           (request_id, environment, payment_id, user_id, requested_amount, approved_amount,
+            consumed_credits, consumed_value, consumption_deduction, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'submitting')`,
+        [
+          requestId,
+          BILLING_ENVIRONMENT,
+          paymentId,
+          user.id,
+          quote.requestedAmount,
+          quote.approvedAmount,
+          quote.consumedCredits,
+          quote.consumedValue,
+          quote.deduction,
+        ]
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error instanceof Error && (
+        error.message.includes('unavailable for automatic refund') ||
+        error.message.includes('No matching credit grant') ||
+        error.message.includes('product has no configured refund credit value') ||
+        error.message.includes('recorded payment amount is invalid')
+      )) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const dodoHost = BILLING_ENVIRONMENT === 'live' ? 'live' : 'test';
+    let providerResponse: globalThis.Response;
+    try {
+      providerResponse = await fetch(`https://${dodoHost}.dodopayments.com/refunds`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(15000),
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          payment_id: paymentId,
+          currency: 'USD',
+          items: [{
+            item_id: productId,
+            amount: quote.approvedAmount,
+            tax_inclusive: true,
+          }],
+          reason: 'Customer refund request adjusted for consumed credits',
+        }),
+      });
+    } catch (error) {
+      await billingPool!.query(
+        `UPDATE billing_refund_requests
+         SET status = 'needs_review', updated_at = NOW()
+         WHERE request_id = $1`,
+        [requestId]
+      );
+      console.error(`Dodo refund request outcome unknown requestId=${requestId} paymentId=${paymentId}`);
+      captureServerError(error, 'dodo-refund-request');
+      res.status(502).json({ error: 'Refund submission could not be confirmed. Contact support before retrying.' });
+      return;
+    }
+
+    let providerBody: { refund_id?: unknown; status?: unknown };
+    try {
+      providerBody = await providerResponse.json() as { refund_id?: unknown; status?: unknown };
+    } catch (error) {
+      await billingPool!.query(
+        `UPDATE billing_refund_requests
+         SET status = 'needs_review', updated_at = NOW()
+         WHERE request_id = $1`,
+        [requestId]
+      );
+      console.error(`Dodo refund response could not be parsed requestId=${requestId} paymentId=${paymentId}`);
+      captureServerError(error, 'dodo-refund-response');
+      res.status(502).json({ error: 'Refund status needs confirmation. Contact support before retrying.' });
+      return;
+    }
+    if (!providerResponse.ok) {
+      await billingPool!.query(
+        `UPDATE billing_refund_requests
+         SET status = 'failed', updated_at = NOW()
+         WHERE request_id = $1`,
+        [requestId]
+      );
+      console.error(
+        `Dodo refund request failed requestId=${requestId} paymentId=${paymentId} status=${providerResponse.status}`
+      );
+      res.status(502).json({ error: 'Dodo Payments could not process this refund request.' });
+      return;
+    }
+    if (typeof providerBody.refund_id !== 'string' || !providerBody.refund_id) {
+      await billingPool!.query(
+        `UPDATE billing_refund_requests
+         SET status = 'needs_review', updated_at = NOW()
+         WHERE request_id = $1`,
+        [requestId]
+      );
+      console.error(`Dodo refund response requires review requestId=${requestId} paymentId=${paymentId}`);
+      res.status(502).json({ error: 'Refund status needs confirmation. Contact support before retrying.' });
+      return;
+    }
+    if (providerBody.status === 'failed') {
+      await billingPool!.query(
+        `UPDATE billing_refund_requests
+         SET provider_refund_id = $1, status = 'failed', updated_at = NOW()
+         WHERE request_id = $2`,
+        [providerBody.refund_id, requestId]
+      );
+      res.status(502).json({ error: 'Dodo Payments declined this refund request.' });
+      return;
+    }
+
+    await billingPool!.query(
+      `UPDATE billing_refund_requests
+       SET provider_refund_id = $1,
+           status = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM billing_refunds
+               WHERE environment = $2 AND refund_id = $1
+             ) THEN 'processed'
+             WHEN status = 'failed' THEN 'failed'
+             ELSE 'submitted'
+           END,
+           updated_at = NOW()
+       WHERE request_id = $3`,
+      [providerBody.refund_id, BILLING_ENVIRONMENT, requestId]
+    );
+    res.status(202).json({
+      status: typeof providerBody.status === 'string' ? providerBody.status : 'submitted',
+      requestedAmount: quote.requestedAmount,
+      consumedValue: quote.consumedValue,
+      approvedAmount: quote.approvedAmount,
+    });
   }));
 
   router.post('/billing/checkout', requireDatabase, requireSameOrigin, asyncRoute(async (req, res) => {

@@ -15,6 +15,25 @@ CREATE TABLE IF NOT EXISTS email_verifications (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS account_invitations (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  redeemed_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS account_invitations_email_created_idx
+  ON account_invitations(email, created_at DESC);
+CREATE INDEX IF NOT EXISTS account_invitations_creator_created_idx
+  ON account_invitations(created_by, created_at DESC);
+
+ALTER TABLE email_verifications
+  ADD COLUMN IF NOT EXISTS invitation_id TEXT REFERENCES account_invitations(id);
+
 CREATE TABLE IF NOT EXISTS user_sessions (
   token_hash TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -136,14 +155,40 @@ CREATE TABLE IF NOT EXISTS billing_payments (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   total_amount BIGINT CHECK (total_amount IS NULL OR total_amount >= 0),
   currency TEXT,
+  product_id TEXT,
   subscription_id TEXT,
   service_period_end TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (environment, payment_id)
 );
 
+ALTER TABLE billing_payments ADD COLUMN IF NOT EXISTS product_id TEXT;
+
 CREATE INDEX IF NOT EXISTS billing_payments_environment_subscription_period_idx
   ON billing_payments(environment, subscription_id, service_period_end);
+
+CREATE TABLE IF NOT EXISTS billing_refund_requests (
+  request_id TEXT PRIMARY KEY,
+  environment TEXT NOT NULL CHECK (environment IN ('test', 'live')),
+  payment_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  requested_amount BIGINT NOT NULL CHECK (requested_amount > 0),
+  approved_amount BIGINT NOT NULL CHECK (approved_amount > 0),
+  consumed_credits BIGINT NOT NULL CHECK (consumed_credits >= 0),
+  consumed_value BIGINT NOT NULL CHECK (consumed_value >= 0),
+  consumption_deduction BIGINT NOT NULL CHECK (consumption_deduction >= 0),
+  provider_refund_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('submitting', 'submitted', 'processed', 'failed', 'needs_review')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (environment, payment_id) REFERENCES billing_payments(environment, payment_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS billing_refund_requests_environment_provider_idx
+  ON billing_refund_requests(environment, provider_refund_id)
+  WHERE provider_refund_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS billing_refund_requests_environment_payment_status_idx
+  ON billing_refund_requests(environment, payment_id, status);
 
 CREATE TABLE IF NOT EXISTS billing_refunds (
   environment TEXT NOT NULL CHECK (environment IN ('test', 'live')),

@@ -120,6 +120,11 @@ export function LegalPages() {
                 receive or store your full payment-card number or security code through the app checkout flow.
               </p>
               <p>
+                If an invitation is created for you, we store the invited email address, invitation creator, a hashed
+                single-use link token, and its expiry, redemption, and revocation timestamps. Invitation links expire
+                after seven days. The invitation email is sent through our configured email delivery provider.
+              </p>
+              <p>
                 Research projects are saved in your browser&apos;s local storage. When you request AI analysis, translation,
                 or note synthesis, the text and related project details you submit are sent to Google&apos;s Gemini service
                 for processing. Do not submit sensitive information unless you are comfortable with that processing.
@@ -169,10 +174,10 @@ export function LegalPages() {
           <>
             <Section title="Requesting a refund">
               <p>
-                Email the address below with the email used at checkout, your Dodo transaction or payment reference, and
-                the reason for the request. Refund requests are reviewed individually and handled through Dodo Payments,
-                our Merchant of Record. Approval and timing are subject to applicable law and Dodo Payments&apos; rules;
-                contact support promptly after a purchase if an issue arises.
+                For an eligible payment, sign in and open Payment history &amp; refund requests in your account panel.
+                The app checks the payment and credit-use records before submitting an adjusted refund request to Dodo
+                Payments, our Merchant of Record. Older or unmatched payments can be referred to the support email
+                below for review. Approval and timing remain subject to applicable law and Dodo Payments&apos; rules.
               </p>
               <p>
                 A successful refund may change the credits associated with the purchase. Refunds are not initiated by
@@ -180,9 +185,17 @@ export function LegalPages() {
                 law remain unaffected.
               </p>
               <p>
+                <strong>Credits spent / consumption rule:</strong> Before an eligible partial refund is submitted, the
+                app calculates the listed USD value of credits consumed from the relevant purchase, based on that
+                product&apos;s configured price and credit allocation. This consumed value is deducted from the requested
+                refund amount. If consumed value is equal to or greater than the amount requested, the app will not
+                submit that refund request. The app shows the calculation before you confirm submission.
+              </p>
+              <p>
                 When Dodo confirms a refund, the app automatically removes the corresponding proportion of credits
                 associated with that payment. Only unspent credits can be removed; credits already used are not converted
-                into a negative balance. Older or unmatched transactions may require manual account review.
+                into a negative balance. Older or unmatched transactions, including subscription payments with rollover
+                credits whose original payment cannot be identified, may require manual account review.
               </p>
             </Section>
             <Section title="Subscription cancellation">
