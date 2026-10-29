@@ -12,6 +12,7 @@ type Plan = {
 
 type Account = {
   user: { email: string };
+  billingEnvironment: 'test' | 'live';
   subscription: {
     plan: string;
     status: string;
@@ -152,9 +153,19 @@ export function BillingPanel() {
               {account ? account.user.email : 'Account, plans & credits'}
             </p>
             <p className="text-xs text-slate-400">
-              {account
-                ? `${account.subscription.isPaid ? account.subscription.plan : 'Pay as you go'} · ${account.totalCredits.toLocaleString()} credits`
-                : 'Sign in to purchase credits or a subscription'}
+              {account ? (
+                <>
+                  <span className={account.billingEnvironment === 'live' ? 'text-emerald-400' : 'text-amber-400'}>
+                    {account.billingEnvironment.toUpperCase()} MODE
+                  </span>
+                  {' · '}
+                  {account.subscription.isPaid ? account.subscription.plan : 'Pay as you go'}
+                  {' · '}
+                  {account.totalCredits.toLocaleString()} paid credits
+                </>
+              ) : (
+                'Sign in to purchase credits or a subscription'
+              )}
             </p>
           </div>
         </div>

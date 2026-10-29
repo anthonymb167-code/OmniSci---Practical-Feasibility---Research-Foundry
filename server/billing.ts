@@ -38,6 +38,22 @@ export const billingPool = process.env.DATABASE_URL
 
 type PlanKey = 'monthly' | 'yearly' | 'starter' | 'power';
 type Bucket = 'subscription' | 'rollover' | 'booster' | 'free';
+type BillingEnvironment = 'test' | 'live';
+
+const configuredDodoEnvironment = process.env.DODO_ENVIRONMENT;
+if (
+  configuredDodoEnvironment &&
+  configuredDodoEnvironment !== 'test_mode' &&
+  configuredDodoEnvironment !== 'live_mode'
+) {
+  throw new Error('DODO_ENVIRONMENT must be exactly test_mode or live_mode.');
+}
+if (process.env.NODE_ENV === 'production' && !configuredDodoEnvironment) {
+  throw new Error('DODO_ENVIRONMENT must be explicitly configured in production.');
+}
+
+export const BILLING_ENVIRONMENT: BillingEnvironment =
+  configuredDodoEnvironment === 'live_mode' ? 'live' : 'test';
 
 interface ProductPlan {
   key: PlanKey;
@@ -185,15 +201,19 @@ async function verifyPassword(password: string, storedHash: string): Promise<boo
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-async function getCreditBalances(userId: string, client: Pool | PoolClient = billingPool!): Promise<Record<Bucket, number>> {
+async function getCreditBalances(
+  userId: string,
+  client: Pool | PoolClient = billingPool!,
+  environment: BillingEnvironment = BILLING_ENVIRONMENT
+): Promise<Record<Bucket, number>> {
   const result = await client.query<{ bucket: Bucket; credits: string }>(
     `SELECT bucket, COALESCE(SUM(remaining), 0)::text AS credits
      FROM credit_grants
-     WHERE user_id = $1 AND remaining > 0
+     WHERE user_id = $1 AND environment = $2 AND remaining > 0
       AND revoked_at IS NULL
       AND (expires_at IS NULL OR expires_at > NOW())
      GROUP BY bucket`,
-    [userId]
+    [userId, environment]
   );
 
   const balances: Record<Bucket, number> = { subscription: 0, rollover: 0, booster: 0, free: 0 };
@@ -211,18 +231,26 @@ function currentFreeGrantPeriod(now = new Date()): { id: string; expiresAt: Date
   };
 }
 
-async function ensureFreeMonthlyGrant(userId: string, client: Pool | PoolClient = billingPool!): Promise<void> {
+async function ensureFreeMonthlyGrant(
+  userId: string,
+  client: Pool | PoolClient = billingPool!,
+  environment: BillingEnvironment = BILLING_ENVIRONMENT
+): Promise<void> {
   const period = currentFreeGrantPeriod();
   await client.query(
     `INSERT INTO credit_grants
-       (user_id, bucket, granted, remaining, expires_at, source_event_id)
-     VALUES ($1, 'free', $2, $2, $3, $4)
-     ON CONFLICT (source_event_id, bucket) DO NOTHING`,
-    [userId, FREE_MONTHLY_CREDITS, period.expiresAt, `free:${userId}:${period.id}`]
+       (environment, user_id, bucket, granted, remaining, expires_at, source_event_id)
+     VALUES ($1, $2, 'free', $3, $3, $4, $5)
+     ON CONFLICT (environment, source_event_id, bucket) DO NOTHING`,
+    [environment, userId, FREE_MONTHLY_CREDITS, period.expiresAt, `free:${userId}:${period.id}`]
   );
 }
 
-async function getSubscription(userId: string, client: Pool | PoolClient = billingPool!): Promise<{
+async function getSubscription(
+  userId: string,
+  client: Pool | PoolClient = billingPool!,
+  environment: BillingEnvironment = BILLING_ENVIRONMENT
+): Promise<{
   plan: string;
   status: string;
   accessExpiresAt: string | null;
@@ -236,10 +264,10 @@ async function getSubscription(userId: string, client: Pool | PoolClient = billi
   }>(
     `SELECT plan_type, status, period_ends_at, grace_ends_at
      FROM billing_subscriptions
-     WHERE user_id = $1
+     WHERE user_id = $1 AND environment = $2
      ORDER BY updated_at DESC
      LIMIT 1`,
-    [userId]
+    [userId, environment]
   );
   const subscription = result.rows[0];
   if (!subscription) return null;
@@ -263,15 +291,16 @@ async function getAccount(user: BillingUser) {
   if (!billingPool) throw new Error('Billing database is unavailable.');
 
   const [subscription, credits] = await Promise.all([
-    getSubscription(user.id),
-    getCreditBalances(user.id),
+    getSubscription(user.id, billingPool, BILLING_ENVIRONMENT),
+    getCreditBalances(user.id, billingPool, BILLING_ENVIRONMENT),
   ]);
   if (!subscription?.isPaid) {
-    await ensureFreeMonthlyGrant(user.id);
-    credits.free = (await getCreditBalances(user.id)).free;
+    await ensureFreeMonthlyGrant(user.id, billingPool, BILLING_ENVIRONMENT);
+    credits.free = (await getCreditBalances(user.id, billingPool, BILLING_ENVIRONMENT)).free;
   }
   return {
     user: { email: user.email },
+    billingEnvironment: BILLING_ENVIRONMENT,
     subscription: subscription ?? { plan: 'free', status: 'inactive', accessExpiresAt: null, isPaid: false },
     credits,
     totalCredits: credits.subscription + credits.rollover + credits.booster,
@@ -348,6 +377,7 @@ async function insertGrant(
   client: PoolClient,
   {
     userId,
+    environment,
     bucket,
     credits,
     expiresAt,
@@ -355,6 +385,7 @@ async function insertGrant(
     paymentId,
   }: {
     userId: string;
+    environment: BillingEnvironment;
     bucket: Bucket;
     credits: number;
     expiresAt: Date | null;
@@ -364,15 +395,16 @@ async function insertGrant(
 ): Promise<void> {
   await client.query(
     `INSERT INTO credit_grants
-       (user_id, bucket, granted, remaining, expires_at, source_event_id, external_payment_id)
-     VALUES ($1, $2, $3, $3, $4, $5, $6)
-     ON CONFLICT (source_event_id, bucket) DO NOTHING`,
-    [userId, bucket, credits, expiresAt, sourceEventId, paymentId ?? null]
+       (environment, user_id, bucket, granted, remaining, expires_at, source_event_id, external_payment_id)
+     VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
+     ON CONFLICT (environment, source_event_id, bucket) DO NOTHING`,
+    [environment, userId, bucket, credits, expiresAt, sourceEventId, paymentId ?? null]
   );
 }
 
 async function processSubscriptionEvent(
   client: PoolClient,
+  environment: BillingEnvironment,
   eventId: string,
   eventType: string,
   data: Record<string, any>
@@ -386,8 +418,8 @@ async function processSubscriptionEvent(
   const userId = await findUserForEvent(data, client);
   await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
   const existingSubscription = await client.query<{ period_ends_at: Date | null }>(
-    'SELECT period_ends_at FROM billing_subscriptions WHERE subscription_id = $1 FOR UPDATE',
-    [subscriptionId]
+    'SELECT period_ends_at FROM billing_subscriptions WHERE environment = $1 AND subscription_id = $2 FOR UPDATE',
+    [environment, subscriptionId]
   );
   const providerEnd = data.next_billing_date ?? data.current_period_end ?? data.period_end;
   const hasProviderEnd = typeof providerEnd === 'string' && !Number.isNaN(Date.parse(providerEnd));
@@ -410,9 +442,9 @@ async function processSubscriptionEvent(
 
   await client.query(
     `INSERT INTO billing_subscriptions
-       (subscription_id, user_id, product_id, plan_type, status, period_ends_at, grace_ends_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-     ON CONFLICT (subscription_id) DO UPDATE SET
+       (environment, subscription_id, user_id, product_id, plan_type, status, period_ends_at, grace_ends_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+     ON CONFLICT (environment, subscription_id) DO UPDATE SET
        user_id = EXCLUDED.user_id,
        product_id = EXCLUDED.product_id,
        plan_type = EXCLUDED.plan_type,
@@ -421,6 +453,7 @@ async function processSubscriptionEvent(
        grace_ends_at = EXCLUDED.grace_ends_at,
        updated_at = NOW()`,
     [
+      environment,
       subscriptionId,
       userId,
       plan.productId,
@@ -435,29 +468,30 @@ async function processSubscriptionEvent(
     const currentSubscriptionCredits = await client.query<{ credits: string }>(
       `SELECT COALESCE(SUM(remaining), 0)::text AS credits
        FROM credit_grants
-       WHERE user_id = $1 AND bucket = 'subscription'
+       WHERE environment = $1 AND user_id = $2 AND bucket = 'subscription'
          AND remaining > 0 AND revoked_at IS NULL`,
-      [userId]
+      [environment, userId]
     );
     const unusedSubscriptionCredits = Number(currentSubscriptionCredits.rows[0]?.credits ?? 0);
 
     await client.query(
       `UPDATE credit_grants SET remaining = 0
-      WHERE user_id = $1 AND bucket = 'subscription' AND remaining > 0`,
-      [userId]
+      WHERE environment = $1 AND user_id = $2 AND bucket = 'subscription' AND remaining > 0`,
+      [environment, userId]
     );
 
     if (eventType === 'subscription.renewed' && plan.key === 'monthly') {
      await client.query(
        `UPDATE credit_grants SET remaining = 0
-        WHERE user_id = $1 AND bucket = 'rollover' AND remaining > 0`,
-       [userId]
+       WHERE environment = $1 AND user_id = $2 AND bucket = 'rollover' AND remaining > 0`,
+       [environment, userId]
      );
     }
 
     if (eventType === 'subscription.renewed' && plan.key === 'monthly' && unusedSubscriptionCredits > 0) {
       await insertGrant(client, {
         userId,
+        environment,
         bucket: 'rollover',
         credits: Math.min(unusedSubscriptionCredits, ROLLOVER_CAP),
         expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
@@ -467,6 +501,7 @@ async function processSubscriptionEvent(
 
     await insertGrant(client, {
       userId,
+      environment,
       bucket: 'subscription',
       credits: plan.credits,
       expiresAt: cycleEnd,
@@ -477,20 +512,21 @@ async function processSubscriptionEvent(
   if (eventType === 'subscription.on_hold' || eventType === 'subscription.expired') {
     await client.query(
       `UPDATE credit_grants SET remaining = 0
-       WHERE user_id = $1 AND bucket = 'subscription' AND remaining > 0`,
-      [userId]
+       WHERE environment = $1 AND user_id = $2 AND bucket = 'subscription' AND remaining > 0`,
+      [environment, userId]
     );
   }
 }
 
 async function processDodoEvent(
   client: PoolClient,
+  environment: BillingEnvironment,
   eventId: string,
   eventType: string,
   data: Record<string, any>
 ): Promise<void> {
   if (eventType.startsWith('subscription.')) {
-    await processSubscriptionEvent(client, eventId, eventType, data);
+    await processSubscriptionEvent(client, environment, eventId, eventType, data);
     return;
   }
 
@@ -507,6 +543,7 @@ async function processDodoEvent(
     await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
     await insertGrant(client, {
       userId,
+      environment,
       bucket: 'booster',
       credits: booster.credits * quantity,
       expiresAt: null,
@@ -519,8 +556,8 @@ async function processDodoEvent(
   if (eventType === 'refund.succeeded' && typeof data.payment_id === 'string') {
     await client.query(
       `UPDATE credit_grants SET remaining = 0, revoked_at = NOW()
-       WHERE external_payment_id = $1 AND bucket = 'booster'`,
-      [data.payment_id]
+       WHERE environment = $1 AND external_payment_id = $2 AND bucket = 'booster'`,
+      [environment, data.payment_id]
     );
   }
 }
@@ -806,11 +843,11 @@ export function createBillingRouter(): Router {
     try {
       await client.query('BEGIN');
       const inserted = await client.query(
-        `INSERT INTO dodo_webhook_events (event_id, event_type)
-         VALUES ($1, $2)
-         ON CONFLICT (event_id) DO NOTHING
+        `INSERT INTO dodo_webhook_events (environment, event_id, event_type)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (environment, event_id) DO NOTHING
          RETURNING event_id`,
-        [webhookId, event.type]
+        [BILLING_ENVIRONMENT, webhookId, event.type]
       );
       if (inserted.rowCount === 0) {
         await client.query('COMMIT');
@@ -818,7 +855,7 @@ export function createBillingRouter(): Router {
         return;
       }
 
-      await processDodoEvent(client, webhookId, event.type, event.data);
+      await processDodoEvent(client, BILLING_ENVIRONMENT, webhookId, event.type, event.data);
       await client.query('COMMIT');
       res.status(200).json({ received: true });
     } catch (error) {
@@ -842,7 +879,11 @@ export function createBillingRouter(): Router {
   return router;
 }
 
-async function settleReservation(reservationId: string, shouldRefund: boolean): Promise<void> {
+async function settleReservation(
+  reservationId: string,
+  environment: BillingEnvironment,
+  shouldRefund: boolean
+): Promise<void> {
   if (!billingPool) return;
 
   const client = await billingPool.connect();
@@ -853,8 +894,8 @@ async function settleReservation(reservationId: string, shouldRefund: boolean): 
       allocations: CreditAllocation[];
       status: string;
     }>(
-      'SELECT user_id, allocations, status FROM credit_reservations WHERE id = $1 FOR UPDATE',
-      [reservationId]
+      'SELECT user_id, allocations, status FROM credit_reservations WHERE environment = $1 AND id = $2 FOR UPDATE',
+      [environment, reservationId]
     );
     const reservation = reservationResult.rows[0];
     if (!reservation || reservation.status !== 'pending') {
@@ -867,10 +908,10 @@ async function settleReservation(reservationId: string, shouldRefund: boolean): 
         await client.query(
           `UPDATE credit_grants
            SET remaining = remaining + $1
-           WHERE id = $2 AND user_id = $3
+          WHERE environment = $2 AND id = $3 AND user_id = $4
              AND revoked_at IS NULL
              AND (bucket = 'booster' OR expires_at IS NULL OR expires_at > NOW())`,
-          [allocation.amount, allocation.grantId, reservation.user_id]
+          [allocation.amount, environment, allocation.grantId, reservation.user_id]
         );
       }
     }
@@ -878,8 +919,8 @@ async function settleReservation(reservationId: string, shouldRefund: boolean): 
     await client.query(
       `UPDATE credit_reservations
        SET status = $1, updated_at = NOW()
-       WHERE id = $2`,
-      [shouldRefund ? 'refunded' : 'committed', reservationId]
+      WHERE environment = $2 AND id = $3`,
+      [shouldRefund ? 'refunded' : 'committed', environment, reservationId]
     );
     await client.query('COMMIT');
   } catch (error) {
@@ -922,14 +963,17 @@ export function requireCredits(cost: number, options: { freeTierAllowed?: boolea
     try {
       await client.query('BEGIN');
       await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [user.id]);
-      const subscription = await getSubscription(user.id, client);
+      const subscription = await getSubscription(user.id, client, BILLING_ENVIRONMENT);
       const hasPaidSubscription = subscription?.isPaid ?? false;
-      if (freeTierAllowed && !hasPaidSubscription) await ensureFreeMonthlyGrant(user.id, client);
+      if (freeTierAllowed && !hasPaidSubscription) {
+        await ensureFreeMonthlyGrant(user.id, client, BILLING_ENVIRONMENT);
+      }
       await client.query(
         `UPDATE credit_grants SET remaining = 0
-         WHERE user_id = $1 AND bucket IN ('subscription', 'rollover', 'free')
+         WHERE environment = $1 AND user_id = $2
+           AND bucket IN ('subscription', 'rollover', 'free')
            AND expires_at IS NOT NULL AND expires_at <= NOW() AND remaining > 0`,
-        [user.id]
+        [BILLING_ENVIRONMENT, user.id]
       );
       const grants = await client.query<{
         id: string;
@@ -938,9 +982,9 @@ export function requireCredits(cost: number, options: { freeTierAllowed?: boolea
       }>(
         `SELECT id, bucket, remaining::text
          FROM credit_grants
-         WHERE user_id = $1 AND remaining > 0
-           AND (bucket <> 'subscription' OR $2::boolean)
-           AND (bucket <> 'free' OR ($3::boolean AND NOT $2::boolean))
+        WHERE environment = $1 AND user_id = $2 AND remaining > 0
+          AND (bucket <> 'subscription' OR $3::boolean)
+          AND (bucket <> 'free' OR ($4::boolean AND NOT $3::boolean))
           AND revoked_at IS NULL
           AND (expires_at IS NULL OR expires_at > NOW())
          ORDER BY
@@ -954,7 +998,7 @@ export function requireCredits(cost: number, options: { freeTierAllowed?: boolea
            created_at ASC,
            id ASC
          FOR UPDATE`,
-        [user.id, hasPaidSubscription, freeTierAllowed]
+        [BILLING_ENVIRONMENT, user.id, hasPaidSubscription, freeTierAllowed]
       );
 
       const available = grants.rows.reduce((total, grant) => total + Number(grant.remaining), 0);
@@ -985,8 +1029,8 @@ export function requireCredits(cost: number, options: { freeTierAllowed?: boolea
         if (outstanding === 0) break;
         const amount = Math.min(outstanding, Number(grant.remaining));
         await client.query(
-          'UPDATE credit_grants SET remaining = remaining - $1 WHERE id = $2',
-          [amount, grant.id]
+          'UPDATE credit_grants SET remaining = remaining - $1 WHERE environment = $2 AND id = $3',
+          [amount, BILLING_ENVIRONMENT, grant.id]
         );
         allocations.push({ grantId: grant.id, bucket: grant.bucket, amount });
         outstanding -= amount;
@@ -994,9 +1038,9 @@ export function requireCredits(cost: number, options: { freeTierAllowed?: boolea
 
       const reservationId = randomUUID();
       await client.query(
-        `INSERT INTO credit_reservations (id, user_id, allocations, status)
-         VALUES ($1, $2, $3, 'pending')`,
-        [reservationId, user.id, JSON.stringify(allocations)]
+        `INSERT INTO credit_reservations (id, environment, user_id, allocations, status)
+         VALUES ($1, $2, $3, $4, 'pending')`,
+        [reservationId, BILLING_ENVIRONMENT, user.id, JSON.stringify(allocations)]
       );
       await client.query('COMMIT');
 
@@ -1004,7 +1048,7 @@ export function requireCredits(cost: number, options: { freeTierAllowed?: boolea
       billingReq.billingUser = user;
       billingReq.creditReservationId = reservationId;
       res.once('finish', () => {
-        void settleReservation(reservationId, res.statusCode >= 400).catch((error) => {
+        void settleReservation(reservationId, BILLING_ENVIRONMENT, res.statusCode >= 400).catch((error) => {
           console.error('Could not finalize AI credit reservation:', error);
         });
       });

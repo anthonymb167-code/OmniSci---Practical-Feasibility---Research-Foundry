@@ -4,7 +4,13 @@ import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
-import { billingPool, createBillingRouter, initializeBillingDatabase, requireCredits } from './server/billing';
+import {
+  BILLING_ENVIRONMENT,
+  billingPool,
+  createBillingRouter,
+  initializeBillingDatabase,
+  requireCredits,
+} from './server/billing';
 
 dotenv.config({ path: ['.env.local', '.env'] });
 
@@ -44,6 +50,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     geminiConfigured: !!process.env.GEMINI_API_KEY,
     billingConfigured: !!billingPool,
+    billingEnvironment: BILLING_ENVIRONMENT,
   });
 });
 
@@ -547,7 +554,7 @@ function generateFallbackFeasibility(payload: any) {
 async function startServer() {
   if (billingPool) {
     await initializeBillingDatabase();
-    console.log('Billing database schema is ready.');
+    console.log(`Billing database schema is ready for ${BILLING_ENVIRONMENT} mode.`);
   } else {
     console.warn('DATABASE_URL is not configured; account, payment, and paid AI routes will remain unavailable.');
   }
