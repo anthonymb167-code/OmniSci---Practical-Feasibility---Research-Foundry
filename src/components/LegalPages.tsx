@@ -179,6 +179,11 @@ export function LegalPages() {
                 cancelling a subscription; send a separate refund request. Any mandatory refund rights under applicable
                 law remain unaffected.
               </p>
+              <p>
+                When Dodo confirms a refund, the app automatically removes the corresponding proportion of credits
+                associated with that payment. Only unspent credits can be removed; credits already used are not converted
+                into a negative balance. Older or unmatched transactions may require manual account review.
+              </p>
             </Section>
             <Section title="Subscription cancellation">
               <p>

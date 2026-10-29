@@ -55,6 +55,8 @@ Signed Dodo webhooks are the sole source of credit grants. The backend verifies 
 
 Webhook event recording and credit fulfillment share one database transaction. A failed fulfillment returns a non-success response so Dodo can retry; the event ID is only marked processed when fulfillment commits, and duplicate deliveries are idempotent. Verify the retry schedule and endpoint status in the Dodo dashboard.
 
+Successful Dodo refunds automatically reduce credits attached to the matching payment. Partial refunds revoke the same proportion of the original grant, and repeated partial refunds are cumulative. Balances never go below zero: if credits have already been spent, only the remaining credits are removed and the spent-credit shortfall is recorded. Each adjustment logs the payment ID, refund ID, credits removed, and shortfall; details are also stored in `billing_refunds`. Refunds for older or unmatched payments, missing purchase amounts, or currency/amount inconsistencies are logged for manual review instead of guessing. Confirm your live webhook subscribes to `refund.succeeded`.
+
 ## Production error monitoring
 
 The server can report errors to Sentry when `SENTRY_DSN` is configured. Monitoring is opt-in. Before sending, the integration removes request/user data, breadcrumbs, additional contexts, and original error messages; stack frames retain locations for diagnosis but not source excerpts or local variables. Create a Sentry project, add its DSN to the Render service environment, then redeploy. Without a DSN, errors continue to be logged to the server console.

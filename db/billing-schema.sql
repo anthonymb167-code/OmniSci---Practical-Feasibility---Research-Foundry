@@ -81,12 +81,20 @@ CREATE TABLE IF NOT EXISTS credit_grants (
   revoked_at TIMESTAMPTZ,
   source_event_id TEXT NOT NULL,
   external_payment_id TEXT,
+  refunded_credits BIGINT NOT NULL DEFAULT 0 CHECK (refunded_credits >= 0 AND refunded_credits <= granted),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (environment, source_event_id, bucket)
 );
 
 ALTER TABLE credit_grants
   ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'test';
+ALTER TABLE credit_grants
+  ADD COLUMN IF NOT EXISTS refunded_credits BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE credit_grants
+  DROP CONSTRAINT IF EXISTS credit_grants_refunded_credits_check;
+ALTER TABLE credit_grants
+  ADD CONSTRAINT credit_grants_refunded_credits_check
+  CHECK (refunded_credits >= 0 AND refunded_credits <= granted);
 
 ALTER TABLE credit_grants
   DROP CONSTRAINT IF EXISTS credit_grants_source_event_id_bucket_key;
@@ -121,6 +129,34 @@ CREATE INDEX IF NOT EXISTS credit_grants_environment_available_idx
 CREATE INDEX IF NOT EXISTS credit_grants_environment_payment_idx
   ON credit_grants(environment, external_payment_id)
   WHERE external_payment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS billing_payments (
+  environment TEXT NOT NULL CHECK (environment IN ('test', 'live')),
+  payment_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  total_amount BIGINT CHECK (total_amount IS NULL OR total_amount >= 0),
+  currency TEXT,
+  subscription_id TEXT,
+  service_period_end TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (environment, payment_id)
+);
+
+CREATE INDEX IF NOT EXISTS billing_payments_environment_subscription_period_idx
+  ON billing_payments(environment, subscription_id, service_period_end);
+
+CREATE TABLE IF NOT EXISTS billing_refunds (
+  environment TEXT NOT NULL CHECK (environment IN ('test', 'live')),
+  refund_id TEXT NOT NULL,
+  payment_id TEXT NOT NULL,
+  amount BIGINT CHECK (amount IS NULL OR amount >= 0),
+  currency TEXT,
+  status TEXT NOT NULL CHECK (status IN ('processed', 'needs_review')),
+  credits_removed BIGINT NOT NULL DEFAULT 0 CHECK (credits_removed >= 0),
+  credits_shortfall BIGINT NOT NULL DEFAULT 0 CHECK (credits_shortfall >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (environment, refund_id)
+);
 
 CREATE TABLE IF NOT EXISTS credit_reservations (
   id TEXT PRIMARY KEY,

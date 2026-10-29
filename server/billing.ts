@@ -374,6 +374,11 @@ function getCycleEnd(data: Record<string, any>, plan: ProductPlan): Date {
   return end;
 }
 
+function getPaymentAmount(data: Record<string, any>): number | null {
+  const amount = data.total_amount ?? data.amount;
+  return Number.isSafeInteger(amount) && amount >= 0 ? amount : null;
+}
+
 async function insertGrant(
   client: PoolClient,
   {
@@ -403,6 +408,21 @@ async function insertGrant(
   );
 }
 
+async function findSubscriptionPaymentId(
+  client: PoolClient,
+  environment: BillingEnvironment,
+  subscriptionId: string,
+  periodEnd: Date
+): Promise<string | undefined> {
+  const result = await client.query<{ payment_id: string }>(
+    `SELECT payment_id FROM billing_payments
+     WHERE environment = $1 AND subscription_id = $2 AND service_period_end = $3
+     ORDER BY created_at DESC LIMIT 1`,
+    [environment, subscriptionId, periodEnd]
+  );
+  return result.rows[0]?.payment_id;
+}
+
 async function processSubscriptionEvent(
   client: PoolClient,
   environment: BillingEnvironment,
@@ -428,6 +448,27 @@ async function processSubscriptionEvent(
     eventType === 'subscription.cancelled' && !hasProviderEnd
       ? existingSubscription.rows[0]?.period_ends_at ?? new Date()
       : getCycleEnd(data, plan);
+  if (typeof data.payment_id === 'string') {
+    await client.query(
+      `INSERT INTO billing_payments
+         (environment, payment_id, user_id, total_amount, currency, subscription_id, service_period_end)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (environment, payment_id) DO UPDATE SET
+         total_amount = COALESCE(EXCLUDED.total_amount, billing_payments.total_amount),
+         currency = COALESCE(EXCLUDED.currency, billing_payments.currency),
+         subscription_id = COALESCE(EXCLUDED.subscription_id, billing_payments.subscription_id),
+         service_period_end = COALESCE(EXCLUDED.service_period_end, billing_payments.service_period_end)`,
+      [
+        environment,
+        data.payment_id,
+        userId,
+        getPaymentAmount(data),
+        typeof data.currency === 'string' ? data.currency : null,
+        subscriptionId,
+        cycleEnd,
+      ]
+    );
+  }
   const status =
     eventType === 'subscription.past_due'
       ? 'past_due'
@@ -500,6 +541,10 @@ async function processSubscriptionEvent(
       });
     }
 
+    const paymentId =
+      typeof data.payment_id === 'string'
+        ? data.payment_id
+        : await findSubscriptionPaymentId(client, environment, subscriptionId, cycleEnd);
     await insertGrant(client, {
       userId,
       environment,
@@ -507,6 +552,7 @@ async function processSubscriptionEvent(
       credits: plan.credits,
       expiresAt: cycleEnd,
       sourceEventId: `${eventId}:subscription`,
+      paymentId,
     });
   }
 
@@ -517,6 +563,152 @@ async function processSubscriptionEvent(
       [environment, userId]
     );
   }
+}
+
+async function applyRefund(
+  client: PoolClient,
+  environment: BillingEnvironment,
+  data: Record<string, any>
+): Promise<void> {
+  const paymentId = typeof data.payment_id === 'string' ? data.payment_id : undefined;
+  const refundId = typeof data.refund_id === 'string' ? data.refund_id : undefined;
+  if (!paymentId || !refundId) {
+    throw new Error('Dodo refund event is missing payment_id or refund_id.');
+  }
+
+  const paymentResult = await client.query<{
+    user_id: string;
+    total_amount: string | null;
+    currency: string | null;
+  }>(
+    `SELECT user_id, total_amount::text, currency
+     FROM billing_payments WHERE environment = $1 AND payment_id = $2 FOR UPDATE`,
+    [environment, paymentId]
+  );
+  const payment = paymentResult.rows[0];
+  const grantResult = await client.query<{
+    id: string;
+    granted: string;
+    remaining: string;
+    refunded_credits: string;
+  }>(
+    `SELECT id, granted::text, remaining::text, refunded_credits::text
+     FROM credit_grants
+     WHERE environment = $1 AND external_payment_id = $2
+       AND bucket IN ('booster', 'subscription')
+     FOR UPDATE`,
+    [environment, paymentId]
+  );
+
+  const isPartial = data.is_partial === true;
+  const reportedAmount = getPaymentAmount(data);
+  const paymentAmount = payment?.total_amount === null || payment?.total_amount === undefined
+    ? null
+    : Number(payment.total_amount);
+  const refundCurrency = typeof data.currency === 'string' ? data.currency : null;
+  const currencyMismatch = Boolean(payment?.currency && refundCurrency && payment.currency !== refundCurrency);
+  const amountExceedsPurchase = paymentAmount !== null && reportedAmount !== null && reportedAmount > paymentAmount;
+
+  if (payment && !currencyMismatch && paymentAmount !== null && paymentAmount > 0 &&
+      !amountExceedsPurchase && (reportedAmount !== null || !isPartial)) {
+    const refundAmount = isPartial ? reportedAmount : paymentAmount;
+    if (refundAmount === null || refundAmount <= 0) {
+      throw new Error(`Dodo refund ${refundId} has an invalid amount.`);
+    }
+
+    const inserted = await client.query(
+      `INSERT INTO billing_refunds
+         (environment, refund_id, payment_id, amount, currency, status)
+       VALUES ($1, $2, $3, $4, $5, 'processed')
+       ON CONFLICT (environment, refund_id) DO NOTHING
+       RETURNING refund_id`,
+      [environment, refundId, paymentId, refundAmount, refundCurrency ?? payment.currency]
+    );
+    if (inserted.rowCount === 0) return;
+
+    const cumulative = await client.query<{ amount: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS amount
+       FROM billing_refunds
+       WHERE environment = $1 AND payment_id = $2 AND status = 'processed'`,
+      [environment, paymentId]
+    );
+    const cumulativeRefundAmount = Math.min(Number(cumulative.rows[0]?.amount ?? 0), paymentAmount);
+    let creditsRemoved = 0;
+    let creditsShortfall = 0;
+
+    for (const grant of grantResult.rows) {
+      const granted = Number(grant.granted);
+      const alreadyRefunded = Number(grant.refunded_credits);
+      const targetRefunded = Math.min(granted, Math.floor((granted * cumulativeRefundAmount) / paymentAmount));
+      const additionalTarget = Math.max(0, targetRefunded - alreadyRefunded);
+      const remaining = Number(grant.remaining);
+      const removed = Math.min(remaining, additionalTarget);
+      const shortfall = additionalTarget - removed;
+      await client.query(
+        `UPDATE credit_grants
+         SET remaining = remaining - $1,
+             refunded_credits = $2,
+             revoked_at = CASE WHEN $2 >= granted THEN NOW() ELSE revoked_at END
+         WHERE environment = $3 AND id = $4`,
+        [removed, targetRefunded, environment, grant.id]
+      );
+      creditsRemoved += removed;
+      creditsShortfall += shortfall;
+    }
+
+    await client.query(
+      `UPDATE billing_refunds SET credits_removed = $1, credits_shortfall = $2
+       WHERE environment = $3 AND refund_id = $4`,
+      [creditsRemoved, creditsShortfall, environment, refundId]
+    );
+    console.info(
+      `Dodo refund credit adjustment paymentId=${paymentId} refundId=${refundId} creditsRemoved=${creditsRemoved} creditsShortfall=${creditsShortfall}`
+    );
+    return;
+  }
+
+  await client.query(
+    `INSERT INTO billing_refunds
+       (environment, refund_id, payment_id, amount, currency, status)
+     VALUES ($1, $2, $3, $4, $5, 'needs_review')
+     ON CONFLICT (environment, refund_id) DO NOTHING`,
+    [environment, refundId, paymentId, reportedAmount, refundCurrency]
+  );
+
+  if (!isPartial && grantResult.rows.length > 0 && !currencyMismatch && !amountExceedsPurchase) {
+    let creditsRemoved = 0;
+    let creditsShortfall = 0;
+    for (const grant of grantResult.rows) {
+      const remaining = Number(grant.remaining);
+      const granted = Number(grant.granted);
+      const alreadyRefunded = Number(grant.refunded_credits);
+      const targetRefunded = granted;
+      const additionalTarget = Math.max(0, targetRefunded - alreadyRefunded);
+      const removed = Math.min(remaining, additionalTarget);
+      creditsShortfall += additionalTarget - removed;
+      await client.query(
+        `UPDATE credit_grants
+         SET remaining = remaining - $1, refunded_credits = $2, revoked_at = NOW()
+         WHERE environment = $3 AND id = $4`,
+        [removed, targetRefunded, environment, grant.id]
+      );
+      creditsRemoved += removed;
+    }
+    await client.query(
+      `UPDATE billing_refunds
+       SET status = 'processed', credits_removed = $1, credits_shortfall = $2
+       WHERE environment = $3 AND refund_id = $4`,
+      [creditsRemoved, creditsShortfall, environment, refundId]
+    );
+    console.info(
+      `Dodo full refund credit adjustment paymentId=${paymentId} refundId=${refundId} creditsRemoved=${creditsRemoved} creditsShortfall=${creditsShortfall}`
+    );
+    return;
+  }
+
+  console.error(
+    `Dodo refund needs manual credit review paymentId=${paymentId} refundId=${refundId} reason=${currencyMismatch ? 'currency_mismatch' : amountExceedsPurchase ? 'refund_amount_exceeds_purchase' : isPartial ? 'partial_refund_missing_purchase_amount' : 'purchase_or_credit_grant_not_found'}`
+  );
 }
 
 async function processDodoEvent(
@@ -533,10 +725,47 @@ async function processDodoEvent(
 
   if (eventType === 'payment.succeeded') {
     const productId = getProductId(data);
-    const booster = plans.find((plan) => plan.kind === 'booster' && plan.productId === productId);
-    if (!booster) return;
-
+    const plan = plans.find((candidate) => candidate.productId === productId);
+    if (!plan) return;
     const userId = await findUserForEvent(data, client);
+    const paymentId = typeof data.payment_id === 'string' ? data.payment_id : undefined;
+    if (paymentId) {
+      const servicePeriod = Array.isArray(data.service_periods) ? data.service_periods[0] : undefined;
+      const servicePeriodEnd =
+        typeof servicePeriod?.ends_at === 'string' && !Number.isNaN(Date.parse(servicePeriod.ends_at))
+          ? new Date(servicePeriod.ends_at)
+          : null;
+      await client.query(
+        `INSERT INTO billing_payments
+           (environment, payment_id, user_id, total_amount, currency, subscription_id, service_period_end)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (environment, payment_id) DO UPDATE SET
+           total_amount = COALESCE(EXCLUDED.total_amount, billing_payments.total_amount),
+           currency = COALESCE(EXCLUDED.currency, billing_payments.currency),
+           subscription_id = COALESCE(EXCLUDED.subscription_id, billing_payments.subscription_id),
+           service_period_end = COALESCE(EXCLUDED.service_period_end, billing_payments.service_period_end)`,
+        [
+          environment,
+          paymentId,
+          userId,
+          getPaymentAmount(data),
+          typeof data.currency === 'string' ? data.currency : null,
+          typeof servicePeriod?.subscription_id === 'string' ? servicePeriod.subscription_id : null,
+          servicePeriodEnd,
+        ]
+      );
+      if (servicePeriodEnd && typeof servicePeriod?.subscription_id === 'string') {
+        await client.query(
+          `UPDATE credit_grants SET external_payment_id = $1
+           WHERE environment = $2 AND user_id = $3 AND bucket = 'subscription'
+             AND expires_at = $4 AND external_payment_id IS NULL`,
+          [paymentId, environment, userId, servicePeriodEnd]
+        );
+      }
+    }
+
+    if (plan.kind !== 'booster') return;
+
     const quantity = Number(data.quantity ?? data.product_cart?.[0]?.quantity ?? 1);
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
       throw new Error('Dodo payment contains an invalid product quantity.');
@@ -546,20 +775,16 @@ async function processDodoEvent(
       userId,
       environment,
       bucket: 'booster',
-      credits: booster.credits * quantity,
+      credits: plan.credits * quantity,
       expiresAt: null,
       sourceEventId: `${eventId}:booster`,
-      paymentId: typeof data.payment_id === 'string' ? data.payment_id : undefined,
+      paymentId,
     });
     return;
   }
 
-  if (eventType === 'refund.succeeded' && typeof data.payment_id === 'string') {
-    await client.query(
-      `UPDATE credit_grants SET remaining = 0, revoked_at = NOW()
-       WHERE environment = $1 AND external_payment_id = $2 AND bucket = 'booster'`,
-      [environment, data.payment_id]
-    );
+  if (eventType === 'refund.succeeded') {
+    await applyRefund(client, environment, data);
   }
 }
 
