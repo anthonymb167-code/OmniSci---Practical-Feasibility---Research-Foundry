@@ -53,4 +53,14 @@ The app's billing routes require a Render PostgreSQL database and Dodo Payments 
 
 Signed Dodo webhooks are the sole source of credit grants. The backend verifies webhook signatures, ignores duplicate event IDs, and stores credits as separate subscription, rollover, booster, and free grants. Billing records are partitioned by `DODO_ENVIRONMENT` (`test_mode` or `live_mode`); existing records are migrated into the test partition by default, so old test credits cannot be spent or displayed in live mode and are not deleted. The account panel displays the active mode. Usage costs 1 credit for note synthesis, 2 for feasibility analysis or historical translation. Unused monthly subscription credits can roll into a 3,000-credit bucket for 30 days; a successful monthly renewal replaces the previous rollover pool. Booster credits do not expire. A free account receives 50 credits per UTC calendar month for one-credit requests only; free credits do not roll over. Complex and historical generation is blocked for free-only balances.
 
+Webhook event recording and credit fulfillment share one database transaction. A failed fulfillment returns a non-success response so Dodo can retry; the event ID is only marked processed when fulfillment commits, and duplicate deliveries are idempotent. Verify the retry schedule and endpoint status in the Dodo dashboard.
+
+## Production error monitoring
+
+The server can report errors to Sentry when `SENTRY_DSN` is configured. Monitoring is opt-in. Before sending, the integration removes request/user data, breadcrumbs, additional contexts, and original error messages; stack frames retain locations for diagnosis but not source excerpts or local variables. Create a Sentry project, add its DSN to the Render service environment, then redeploy. Without a DSN, errors continue to be logged to the server console.
+
+## Public policies
+
+The app serves its Terms of Service at `/terms`, Privacy Policy at `/privacy`, and Refund Policy at `/refunds`; links are in the app footer. Review these pages against your actual business operations and applicable law before launch. Subscription cancellation requests currently need to be handled by support and confirmed through the payment provider; there is no in-app cancellation control.
+
 Email verification, Dodo checkout, payment fulfillment, and paid AI usage cannot be fully exercised until the Render database, SMTP, Dodo products, and webhook secrets are configured.

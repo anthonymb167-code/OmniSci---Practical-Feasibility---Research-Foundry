@@ -9,6 +9,7 @@ import { Pool, PoolClient } from 'pg';
 import { Webhook } from 'standardwebhooks';
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
+import { captureServerError } from './monitoring';
 
 dotenv.config({ path: ['.env.local', '.env'] });
 
@@ -859,6 +860,7 @@ export function createBillingRouter(): Router {
       await client.query('COMMIT');
       res.status(200).json({ received: true });
     } catch (error) {
+      captureServerError(error, 'dodo-webhook-processing');
       await client.query('ROLLBACK');
       console.error('Dodo webhook processing failed:', error);
       res.status(500).send('Webhook processing failed.');
@@ -872,6 +874,7 @@ export function createBillingRouter(): Router {
       next(error);
       return;
     }
+    captureServerError(error, 'billing-route');
     console.error('Billing route failed:', error);
     res.status(500).json({ error: 'Billing service request failed.' });
   });

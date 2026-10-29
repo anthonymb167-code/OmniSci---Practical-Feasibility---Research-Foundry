@@ -4,6 +4,7 @@ import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
+import { captureServerError, initializeErrorMonitoring } from './server/monitoring';
 import {
   BILLING_ENVIRONMENT,
   billingPool,
@@ -13,6 +14,7 @@ import {
 } from './server/billing';
 
 dotenv.config({ path: ['.env.local', '.env'] });
+const errorMonitoringEnabled = initializeErrorMonitoring();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,6 +53,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     geminiConfigured: !!process.env.GEMINI_API_KEY,
     billingConfigured: !!billingPool,
     billingEnvironment: BILLING_ENVIRONMENT,
+    errorMonitoringEnabled,
   });
 });
 
@@ -188,6 +191,7 @@ Generate JSON with the following structure:
         const parsed = JSON.parse(responseText);
         return res.json({ success: true, data: parsed });
       } catch (parseError) {
+        captureServerError(parseError, 'feasibility-response-parse');
         console.error('JSON parse error from Gemini output:', parseError, responseText);
         // Fall back to clean JSON extraction if wrapped
         const jsonMatch = responseText.match(/\{[\s\S]*\}/);
@@ -202,6 +206,7 @@ Generate JSON with the following structure:
     const fallbackData = generateFallbackFeasibility(req.body);
     return res.json({ success: true, data: fallbackData, isFallback: !ai });
   } catch (error: any) {
+    captureServerError(error, 'feasibility-analysis');
     console.error('Feasibility analysis error:', error);
     return res.status(502).json({ error: 'AI analysis failed. Reserved credits will be restored.' });
   }
@@ -297,6 +302,7 @@ Return JSON format:
       },
     });
   } catch (error: any) {
+    captureServerError(error, 'historical-translation');
     console.error('Translation error:', error);
     return res.status(502).json({ error: 'AI translation failed. Reserved credits will be restored.' });
   }
@@ -365,6 +371,7 @@ Return JSON:
       },
     });
   } catch (error: any) {
+    captureServerError(error, 'note-synthesis');
     console.error('Notes synthesis error:', error);
     return res.status(502).json({ error: 'AI synthesis failed. Reserved credits will be restored.' });
   }
@@ -588,6 +595,7 @@ async function startServer() {
 }
 
 startServer().catch((err) => {
+  captureServerError(err, 'server-startup');
   console.error('Failed to start server:', err);
   process.exit(1);
 });
