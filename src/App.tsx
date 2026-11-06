@@ -397,10 +397,18 @@ export default function App() {
             <span>•</span>
             <span>Regulatory: FDA / EMA / ISO 13485 / COSPAR IVb</span>
           </div>
-          <nav aria-label="Legal pages" className="flex flex-wrap items-center justify-center gap-3 text-[11px]">
+          <nav aria-label="Footer links" className="flex flex-wrap items-center justify-center gap-3 text-[11px]">
             <a href="/terms" className="hover:text-cyan-300">Terms</a>
             <a href="/privacy" className="hover:text-cyan-300">Privacy</a>
             <a href="/refunds" className="hover:text-cyan-300">Refunds &amp; Cancellation</a>
+            <a
+              href="https://www.producthunt.com/p/omnisci-foundry/i-built-omnisci-to-check-if-your-startup-idea-is-actually-practical"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-cyan-300"
+            >
+              Upvote on Product Hunt
+            </a>
           </nav>
         </div>
       </footer>
