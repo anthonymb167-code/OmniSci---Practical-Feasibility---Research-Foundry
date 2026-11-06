@@ -401,17 +401,19 @@ export default function App() {
             <a href="/terms" className="hover:text-cyan-300">Terms</a>
             <a href="/privacy" className="hover:text-cyan-300">Privacy</a>
             <a href="/refunds" className="hover:text-cyan-300">Refunds &amp; Cancellation</a>
-            <a
-              href="https://www.producthunt.com/p/omnisci-foundry/i-built-omnisci-to-check-if-your-startup-idea-is-actually-practical"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-cyan-300"
-            >
-              Upvote on Product Hunt
-            </a>
           </nav>
         </div>
       </footer>
+      <a
+        href="https://www.producthunt.com/p/omnisci-foundry/i-built-omnisci-to-check-if-your-startup-idea-is-actually-practical"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Upvote OmniSci Foundry on Product Hunt"
+        className="fixed bottom-5 right-5 z-[99999] rounded-lg border border-orange-200 bg-white px-4 py-2.5 text-left text-slate-900 shadow-lg transition hover:-translate-y-0.5 hover:shadow-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500"
+      >
+        <span className="block text-[10px] font-semibold uppercase tracking-wider text-orange-600">Upvote on</span>
+        <span className="block text-sm font-bold">Product Hunt <span aria-hidden="true">↗</span></span>
+      </a>
     </div>
   );
 }
